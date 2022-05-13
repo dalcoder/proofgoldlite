@@ -64,3 +64,8 @@ val db_max_in_cache : int ref
 val min_conns_pow : int ref
 val min_conn_pow_target : int32 ref
 val max_conn_pow_tries : int ref
+val liteserver : bool ref
+val liteserverip : string option ref
+val liteserveronion : string option ref
+val liteserverport : int ref
+
