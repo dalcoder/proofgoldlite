@@ -19,6 +19,7 @@ let stringconfigvars = [
 ("bootstrapurl",fun x -> Config.bootstrapurl := x)
 ];;
 let boolconfigvars = [
+("liteserver",fun x -> Config.liteserver := x);
 ("genesis",fun x -> Config.genesis := x);
 ("offline",fun x -> Config.offline := x);
 ("ltcoffline",fun x -> Config.ltcoffline := x);
@@ -35,6 +36,7 @@ let boolconfigvars = [
 ("ltcrpcavoidcurl",fun x -> Config.ltcrpcavoidcurl := x)
 ];;
 let intconfigvars = [
+("liteserverport",fun x -> Config.liteserverport := x);
 ("max_conn_pow_tries",fun x -> Config.max_conn_pow_tries := x);
 ("min_conn_pow_target",fun x -> Config.min_conn_pow_target := Int32.of_int x);
 ("min_conns_pow",fun x -> Config.min_conns_pow := x);
@@ -64,6 +66,8 @@ let atomsofbarsconfigvars = [
 ("defaulttxfee",fun x -> Config.defaulttxfee := x)
 ];;
 let stringoptionconfigvars = [
+("liteserverip",fun x -> Config.liteserverip := x);
+("liteserveronion",fun x -> Config.liteserveronion := x);
 ("proxyip",fun x -> Config.proxyip := x);
 ("ip",fun x -> Config.ip := x);
 ("onion",fun x -> Config.onion := x);
