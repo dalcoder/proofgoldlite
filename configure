@@ -28,7 +28,7 @@ do
     fi
 done
 if [ ! $DATADIR ]; then
-    DATADIR=$HOME/.proofgold
+    DATADIR=$HOME/.proofgoldlite
 fi
 if [ ! -d $DATADIR ]; then
   mkdir $DATADIR
