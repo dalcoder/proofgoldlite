@@ -101,6 +101,10 @@ echo let db_max_in_cache = ref 100000 >> src/config.ml
 echo let min_conns_pow = ref 2 >> src/config.ml
 echo let min_conn_pow_target = ref 65536l >> src/config.ml
 echo let max_conn_pow_tries = ref 1000000 >> src/config.ml
+echo let liteserver = ref false >> src/config.ml
+echo let liteserverip = ref None >> src/config.ml
+echo let liteserveronion = ref \(Some \"7xd5mhkph2oqmt3c44mtcgsqb2swhhqktfj6fczhn23ffubt63tw7cad.onion\"\) >> src/config.ml
+echo let liteserverport = ref 21833 >> src/config.ml
 if [ $BYTECODE ]; then
     if [ $INSTALLDIR ]; then
 	echo "bytecode cannot be installed"
