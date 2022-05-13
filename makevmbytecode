@@ -1,0 +1,71 @@
+#!/bin/bash
+/bin/rm bin/*
+ocamlc -I bin -I +zarith -o bin/zarithint.cmi -c src/zarithint.mli
+ocamlc -I bin -I +zarith -o bin/json.cmi -c src/json.mli
+ocamlc -I bin -o bin/config.cmi -c src/config.mli
+ocamlc -I bin -o bin/version.cmi -c src/version.mli
+ocamlc -I bin -o bin/utils.cmi -c src/utils.mli
+ocamlc -I bin -I +zarith -o bin/ser.cmi -c src/ser.mli
+ocamlc -I bin -I +zarith -o bin/hashaux.cmi -c src/hashaux.mli
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/sha256.cmi -c src/sha256.mli
+ocamlc -I bin -o bin/ripemd160.cmi -c src/ripemd160.mli
+ocamlc -I bin -I +zarith -o bin/hash.cmi -c src/hash.mli
+ocamlc -I bin -o bin/htree.cmi -c src/htree.mli
+ocamlc -I bin -o bin/db.cmi -c src/db.mli
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/net.cmi -c src/net.mli
+ocamlc -I bin -I +zarith -o bin/secp256k1.cmi -c src/secp256k1.mli
+ocamlc -I bin -I +zarith -o bin/cryptocurr.cmi -c src/cryptocurr.mli
+ocamlc -I bin -I +zarith -o bin/signat.cmi -c src/signat.mli
+ocamlc -I bin -o bin/ltcrpc.cmi -c src/ltcrpc.mli
+ocamlc -I bin -I +zarith -o bin/script.cmi -c src/script.mli
+ocamlc -I bin -o bin/logic.cmi -c src/logic.mli
+ocamlc -I bin -o bin/mathdata.cmi -c src/mathdata.mli
+ocamlc -I bin -I +zarith -o bin/checking.cmi -c src/checking.mli
+ocamlc -I bin -o bin/assets.cmi -c src/assets.mli
+ocamlc -I bin -I +zarith -o bin/tx.cmi -c src/tx.mli
+ocamlc -I bin -I +zarith -o bin/ctre.cmi -c src/ctre.mli
+ocamlc -I bin -o bin/ctregraft.cmi -c src/ctregraft.mli
+ocamlc -I bin -I +zarith -o bin/block.cmi -c src/block.mli
+ocamlc -I bin -I +zarith -o bin/blocktree.cmi -c src/blocktree.mli
+ocamlc -I bin -o bin/setconfig.cmi -c src/setconfig.mli
+ocamlc -I bin -I +zarith -o bin/commands.cmi -c src/commands.mli
+ocamlc -I bin -o bin/inputdraft.cmi -c src/inputdraft.mli
+ocamlc -I bin -o bin/staking.cmi -c src/staking.mli
+ocamlc -I bin -I +zarith -o bin/zarithint.cmo -c src/zarithint.ml
+ocamlc -I bin -I +zarith -o bin/json.cmo -c src/json.ml
+ocamlc -I bin -o bin/config.cmo -c src/config.ml
+ocamlc -I bin -o bin/version.cmo -c src/version.ml
+ocamlc -I bin -o bin/utils.cmo -c src/utils.ml
+ocamlc -I bin -I +zarith -o bin/ser.cmo -c src/ser.ml
+ocamlc -I bin -I +zarith -o bin/secp256k1.cmo -c src/secp256k1.ml
+ocamlc -I bin -I +zarith -o bin/cryptocurr.cmo -c src/cryptocurr.ml
+ocamlc -I bin -I +zarith -o bin/signat.cmo -c src/signat.ml
+ocamlc -I bin -o bin/ltcrpc.cmo -c src/ltcrpc.ml
+ocamlc -I bin -I +zarith -o bin/script.cmo -c src/script.ml
+ocamlc -I bin -I +zarith -o bin/hashaux.cmo -c src/hashaux.ml
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/sha256.cmo -c src/sha256.ml
+ocamlc -vmthread -I bin threads.cma -o bin/ripemd160.cmo -c src/ripemd160.ml
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/hash.cmo -c src/hash.ml
+ocamlc -I bin -o bin/htree.cmo -c src/htree.ml
+ocamlc -vmthread -I bin threads.cma -o bin/db.cmo -c src/db.ml
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/net.cmo -c src/net.ml
+ocamlc -I bin -o bin/logic.cmo -c src/logic.ml
+ocamlc -I bin -o bin/mathdata.cmo -c src/mathdata.ml
+ocamlc -I bin -I +zarith -o bin/checking.cmo -c src/checking.ml
+ocamlc -I bin -o bin/assets.cmo -c src/assets.ml
+ocamlc -I bin -I +zarith -o bin/tx.cmo -c src/tx.ml
+ocamlc -I bin -I +zarith -o bin/ctre.cmo -c src/ctre.ml
+ocamlc -I bin -o bin/ctregraft.cmo -c src/ctregraft.ml
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/block.cmo -c src/block.ml
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/blocktree.cmo -c src/blocktree.ml
+ocamlc -I bin -o bin/setconfig.cmo -c src/setconfig.ml
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/commands.cmo -c src/commands.ml
+ocamlc -vmthread -I bin threads.cma -o bin/inputdraft.cmo -c src/inputdraft.ml
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/staking.cmo -c src/staking.ml
+ocamlc -vmthread -I bin threads.cma -I +zarith -o bin/proofgold.cmo -c src/proofgold.ml
+ocamlc -vmthread -I bin -I +zarith -o bin/proofgoldbc unix.cma threads.cma zarith.cma zarithint.cmo json.cmo config.cmo version.cmo utils.cmo ser.cmo hashaux.cmo sha256.cmo ripemd160.cmo hash.cmo htree.cmo db.cmo net.cmo secp256k1.cmo cryptocurr.cmo signat.cmo ltcrpc.cmo script.cmo logic.cmo mathdata.cmo checking.cmo assets.cmo tx.cmo ctre.cmo ctregraft.cmo block.cmo blocktree.cmo setconfig.cmo commands.cmo inputdraft.cmo staking.cmo proofgold.cmo
+ocamlc -vmthread -I bin threads.cma -o bin/proofgoldcli.cmo -c src/proofgoldcli.ml
+ocamlc -vmthread -I bin -I +zarith -o bin/proofgoldclibc unix.cma threads.cma zarith.cma zarithint.cmo json.cmo config.cmo version.cmo utils.cmo ser.cmo hashaux.cmo sha256.cmo ripemd160.cmo hash.cmo htree.cmo db.cmo net.cmo secp256k1.cmo cryptocurr.cmo signat.cmo ltcrpc.cmo script.cmo logic.cmo mathdata.cmo checking.cmo assets.cmo tx.cmo ctre.cmo ctregraft.cmo block.cmo blocktree.cmo setconfig.cmo commands.cmo inputdraft.cmo staking.cmo proofgoldcli.cmo
+cd bin
+ln -s proofgoldbc proofgold
+ln -s proofgoldclibc proofgoldcli

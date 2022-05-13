@@ -1,0 +1,152 @@
+#!/bin/bash
+for v in "$@"
+do
+    if [ $v == "-bytecode" ]; then
+	BYTECODE="1"
+    else
+	if [ ${v:0:12} == "-proofgolddir=" ]; then
+            INSTALLDIR=${v:12}
+	    if [ ! -d $INSTALLDIR ]; then
+		echo "$INSTALLDIR is not a directory"
+	    fi
+	else
+	    if [ ${v:0:9} == "-datadir=" ]; then
+		DATADIR=${v:9}
+	    else
+		if [ ${v:0:12} = "-randomseed=" ]; then
+		    RANDOMSEED=${v:12}
+		else
+		    echo "Unknown command line argument $v"
+		    echo "configure can be given the following arguments:"
+		    echo "-bytecode (to only build bytecode)"
+		    echo "-proofgolddir=<dir> (to specify the install directory)"
+		    echo "-datadir=<dir> (to specify the default directory for Proofgold data)"
+		    echo "-randomseed=<string> (a user provided string to seed OCaml's Random module)"
+		fi
+	    fi
+	fi
+    fi
+done
+if [ ! $DATADIR ]; then
+    DATADIR=$HOME/.proofgold
+fi
+if [ ! -d $DATADIR ]; then
+  mkdir $DATADIR
+fi
+if [ ! -d $DATADIR/testnet ]; then
+  mkdir $DATADIR/testnet
+fi
+echo let datadir = ref \"$DATADIR\" > src/config.ml
+echo let testnet = ref false >> src/config.ml
+echo let staking = ref false >> src/config.ml
+echo let swapping = ref false >> src/config.ml
+echo let daemon = ref false >> src/config.ml
+echo let offline = ref false >> src/config.ml
+echo let ltcoffline = ref false >> src/config.ml
+echo let ltcversion = ref 17 >> src/config.ml
+echo let ltcsubversion = ref 1 >> src/config.ml
+echo let proxyip = ref None >> src/config.ml
+echo let ip = ref None >> src/config.ml
+echo let ipv6 = ref false >> src/config.ml
+echo let port = ref 21805 >> src/config.ml
+echo let onion = ref None >> src/config.ml
+echo let onionlocalport = ref 21807 >> src/config.ml
+echo let onionremoteport = ref 21808 >> src/config.ml
+echo let socks = ref None >> src/config.ml
+echo let socksport = ref 9050 >> src/config.ml
+echo let rpcuser = ref \"user\" >> src/config.ml
+echo let rpcpass = ref \"changeme\" >> src/config.ml
+echo let rpcport = ref 21810 >> src/config.ml
+echo let ltcrpcip = ref \"127.0.0.1\" >> src/config.ml
+echo let ltcrpconion = ref None >> src/config.ml
+echo let ltcrpcport = ref 9332 >> src/config.ml
+echo let ltcrpcuser = ref \"ltcuser\" >> src/config.ml
+echo let ltcrpcpass = ref \"ltcpass\" >> src/config.ml
+echo let ltcaddresses = ref [] >> src/config.ml
+echo let ltctradeaddresses = ref [] >> src/config.ml
+echo let pfgtradeaddresses = ref [] >> src/config.ml
+echo let curl = ref \"`which curl`\" >> src/config.ml
+echo let ltcrpcavoidcurl = ref true >> src/config.ml
+echo let maxconns = ref 20 >> src/config.ml
+echo let lastcheckpoint = ref \"\" >> src/config.ml
+echo let prompt = ref \"\> \" >> src/config.ml
+echo let offlinestakerewardsdest = ref false >> src/config.ml
+echo let offlinestakerewardslock = ref None >> src/config.ml
+echo let generatenewrewardaddresses = ref true >> src/config.ml
+echo let stakewithrewards = ref true >> src/config.ml
+echo let reward_lock_relative = ref None >> src/config.ml
+echo let reward_lock_absolute = ref None >> src/config.ml
+echo let invalidatedblocks = ref [] >> src/config.ml
+echo let validatedblocks = ref [] >> src/config.ml
+echo let genesistimestamp = ref 0L >> src/config.ml
+echo let genesis = ref false >> src/config.ml
+echo let maxburn = ref 0L >> src/config.ml
+echo let ltctxfee = ref 1000L >> src/config.ml
+echo let minltctxfee = ref 500L >> src/config.ml
+echo let minrelayfee = ref 10000L >> src/config.ml
+echo let defaulttxfee = ref 10000L >> src/config.ml
+echo let extraindex = ref false >> src/config.ml
+if [ $RANDOMSEED ]; then
+    echo let randomseed = ref \(Some \"$RANDOMSEED\"\) >> src/config.ml
+else
+    echo let randomseed = ref None >> src/config.ml
+fi
+echo let independentbootstrap = ref false >> src/config.ml
+echo let bootstrapurl = ref \"\" >> src/config.ml
+echo let fullnode = ref true >> src/config.ml
+echo let minconnstostake = ref 2 >> src/config.ml
+echo let gc_space_overhead = ref 80 >> src/config.ml
+echo let gc_stack_limit = ref 1048576 >> src/config.ml
+echo let db_max_in_cache = ref 100000 >> src/config.ml
+echo let min_conns_pow = ref 2 >> src/config.ml
+echo let min_conn_pow_target = ref 65536l >> src/config.ml
+echo let max_conn_pow_tries = ref 1000000 >> src/config.ml
+if [ $BYTECODE ]; then
+    if [ $INSTALLDIR ]; then
+	echo "bytecode cannot be installed"
+	echo "configure failed"
+	exit 1
+    fi
+fi
+OCAMLC=`which ocamlc`
+if [ -z $OCAMLC ]; then
+    echo 'Could not find ocamlc'
+    echo 'configure failed'
+    exit 1
+fi
+echo OCAMLC=$OCAMLC > Makefile
+if [ $BYTECODE ]; then
+    echo 'all: bytecode' >> Makefile
+else
+    OCAMLOPT=`which ocamlopt`
+    if [ -z $OCAMLOPT ]; then
+	echo 'Could not find ocamlopt'
+	echo 'Only the bytecode will be created'
+	BYTECODE=1
+	INSTALLDIR=""
+	echo 'all: bytecode' >> Makefile
+    else
+	echo OCAMLOPT=$OCAMLOPT >> Makefile
+	echo 'all: opt' >> Makefile
+    fi
+fi
+cat Makefile.in >> Makefile
+if [ -z $INSTALLDIR ]; then
+    if [ -d /usr/local/bin ]; then
+	INSTALLDIR="/usr/local/bin"
+    else
+	if [ -d /usr/bin ]; then
+	    INSTALLDIR="/usr/bin"
+	else
+	    echo 'No installation directory could be determined'
+	    echo 'make install cannot be run'
+	    echo 'To resolve this give -proofgolddir=<dir> as an argument to configure.'
+	fi
+    fi
+fi
+if [ -n $INSTALLDIR ]; then
+    echo INSTALLDIR=$INSTALLDIR >> Makefile
+    echo '' >> Makefile
+    echo 'install:' >> Makefile
+    echo -e '\tcp bin/proofgold $(INSTALLDIR)' >> Makefile
+fi
