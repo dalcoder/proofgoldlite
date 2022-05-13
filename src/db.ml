@@ -1,3 +1,4 @@
+(* Copyright (c) 2022 The Proofgold Lite developers *)
 (* Copyright (c) 2020-2021 The Proofgold Core developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
 (* Copyright (c) 2017-2018 The Dalilcoin developers *)
@@ -75,7 +76,7 @@ let dbconfig dir =
       ()
     else
       raise (Failure (dir ^ " is a file not a directory"))
-  else if not (!Config.independentbootstrap) && !Config.bootstrapurl = "" then
+  else if not !Config.liteserver || !Config.ltcoffline || (not (!Config.independentbootstrap) && !Config.bootstrapurl = "") then
     raise NoBootstrapURL
   else
     begin

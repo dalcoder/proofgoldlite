@@ -1,3 +1,4 @@
+(* Copyright (c) 2022 The Proofgold Lite developers *)
 (* Copyright (c) 2020-2021 The Proofgold Core developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
 (* Copyright (c) 2015-2017 The Qeditas developers *)
@@ -5400,16 +5401,21 @@ let initialize () =
         dbconfig dbdir; (*** configure the database ***)
       with
       | NoBootstrapURL ->
-         if not !Config.daemon then
-           (Printf.printf "Searching the ltc chain for a bootstrap URL\n"; flush stdout);
-         search_ltc_bootstrap_url ();
-         if !Config.bootstrapurl = "" then
+         if !Config.liteserver then
            begin
-             Printf.printf "No bootstrap url found.\n";
-             !exitfn 1;
+             if not !Config.daemon then
+               (Printf.printf "Searching the ltc chain for a bootstrap URL\n"; flush stdout);
+             search_ltc_bootstrap_url ();
+             if !Config.bootstrapurl = "" then
+               begin
+                 Printf.printf "No bootstrap url found.\n";
+                 !exitfn 1;
+               end
+             else
+               Unix.mkdir dbdir 0b111111000;
            end
          else
-           dbconfig dbdir
+           Unix.mkdir dbdir 0b111111000;
     end;
     DbTheory.dbinit();
     DbTheoryTree.dbinit();
@@ -5788,7 +5794,7 @@ let initialize () =
 	    recfl;
 	  !exitfn 0
     end;
-    if not !Config.offline && not !Config.ltcoffline then
+    if !Config.liteserver && not !Config.offline && not !Config.ltcoffline then
       begin
 	if not !Config.daemon then (Printf.fprintf sout "Syncing with ltc.\n"; flush sout);
 	ltc_init sout;
@@ -5930,12 +5936,12 @@ let main () =
       match Unix.fork() with
       | 0 ->
 	  initialize();
-	  if not !Config.offline then
+	  if !Config.liteserver && not !Config.offline then
 	    begin
 	      initnetwork !Utils.log;
 	      if !Config.staking then stkth := Some(Thread.create stakingthread ());
 	      if !Config.swapping then swpth := Some(Thread.create swappingthread ());
-	      if not !Config.ltcoffline then ltc_listener_th := Some(Thread.create ltc_listener ());
+	      if !Config.liteserver && not !Config.ltcoffline then ltc_listener_th := Some(Thread.create ltc_listener ());
 	    end;
 	  daemon_readevalloop ()
       | pid -> Printf.printf "Proofgold daemon process %d started.\n" pid
@@ -5944,12 +5950,12 @@ let main () =
     begin
       initialize();
       set_signal_handlers();
-      if not !Config.offline then
+      if !Config.liteserver && not !Config.offline then
 	begin
 	  initnetwork stdout;
 	  if !Config.staking then stkth := Some(Thread.create stakingthread ());
 	  if !Config.swapping then swpth := Some(Thread.create swappingthread ());
-	  if not !Config.ltcoffline then ltc_listener_th := Some(Thread.create ltc_listener ());
+	  if !Config.liteserver && not !Config.ltcoffline then ltc_listener_th := Some(Thread.create ltc_listener ());
 	end;
       readevalloop()
     end;;
