@@ -1,5 +1,3 @@
-(* Copyright (c) 2022 The Proofgold Lite developers *)
-(* Copyright (c) 2020-2021 The Proofgold Core developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
 (* Copyright (c) 2015 The Qeditas developers *)
 (* Copyright (c) 2017-2018 The Dalilcoin developers *)

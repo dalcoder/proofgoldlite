@@ -200,3 +200,5 @@ exception MissingCTreeAtm of hashval * bool list
                                                                               
 val verifyhlist_h : hashval -> bool list -> unit
 val verifyledger_h : hashval -> bool list -> unit
+
+val octree_reduce_to_min_support : (bool list * hashval) list -> bool list list -> bool list list -> ctree option -> ctree option

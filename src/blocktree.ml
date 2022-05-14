@@ -1,3 +1,4 @@
+(* Copyright (c) 2022 The Proofgold Lite developers *)
 (* Copyright (c) 2020-2021 The Proofgold Core developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
 (* Copyright (c) 2015-2016 The Qeditas developers *)
@@ -84,6 +85,7 @@ let published_stx : (hashval,unit) Hashtbl.t = Hashtbl.create 1000;;
 let unconfirmed_spent_assets : (hashval,hashval) Hashtbl.t = Hashtbl.create 100;;
 
 let artificialledgerroot = ref None;;
+let artificialblockheight = ref (-1L);;
 let artificialbestblock = ref None;;
 
 let recentheaders : (hashval,unit) Hashtbl.t = Hashtbl.create 1000;;
@@ -91,6 +93,179 @@ let blockinvalidated : (hashval,unit) Hashtbl.t = Hashtbl.create 1000;;
 
 let delayed_headers : (hashval * hashval,Z.t -> unit) Hashtbl.t = Hashtbl.create 100;;
 let delayed_deltas : (hashval * hashval,hashval option -> hashval option -> Z.t -> unit) Hashtbl.t = Hashtbl.create 100;;
+
+(** Lite client communication **)
+type liteservmsg =
+  | LSState of int64 * hashval * hashval * hashval * hashval * (int64 * int64 * (hashval * int32) * (hashval * hashval) option * hashval) * (Z.t * int64 * hashval * hashval option * hashval option)
+  | LSCTree of ctree
+  | LSTTree of ttree
+  | LSSTree of stree
+  | LSSuccess
+  | LSFailed
+
+type liteclientmsg =
+  | LCStateRequest
+  | LCCTreeRequest of hashval * addr
+  | LCTTreeRequest of hashval
+  | LCSTreeRequest of hashval
+  | LCSendTx of stx
+
+let seo_liteservmsg o lsm c =
+  match lsm with
+  | LSState(blkh,dbh,lbk,ltx,currledgerroot,(tm1,burned,lutxo,prev,stkmod),vhv) ->
+     let c = o 2 0 c in
+     seo_prod7 seo_int64 seo_hashval seo_hashval seo_hashval seo_hashval
+       (seo_prod5 seo_int64 seo_int64 (seo_prod seo_hashval seo_int32) (seo_option (seo_prod seo_hashval seo_hashval)) seo_hashval)
+       (seo_prod5 seo_big_int_256 seo_int64 seo_hashval (seo_option seo_hashval) (seo_option seo_hashval))
+       o (blkh,dbh,lbk,ltx,currledgerroot,(tm1,burned,lutxo,prev,stkmod),vhv) c
+  | LSCTree(tr) ->
+     let c = o 2 1 c in
+     seo_ctree o tr c
+  | LSTTree(tr) ->
+     let c = o 2 3 c in
+     let c = o 1 1 c in
+     let c = o 2 0 c in
+     seo_htree seo_theory o tr c
+  | LSSTree(tr) ->
+     let c = o 2 3 c in
+     let c = o 1 1 c in
+     let c = o 2 1 c in
+     seo_htree (seo_prod (seo_option seo_hashval) seo_signa) o tr c
+  | LSSuccess ->
+     let c = o 2 2 c in
+     c
+  | LSFailed ->
+     let c = o 2 3 c in
+     let c = o 1 0 c in
+     c
+
+let sei_liteservmsg i c =
+  let (x,c) = i 2 c in
+  if x = 0 then
+    let ((blkh,dbh,lbk,ltx,currledgerroot,ov,vhv),c) =
+      sei_prod7 sei_int64 sei_hashval sei_hashval sei_hashval sei_hashval
+        (sei_prod5 sei_int64 sei_int64 (sei_prod sei_hashval sei_int32) (sei_option (sei_prod sei_hashval sei_hashval)) sei_hashval)
+        (sei_prod5 sei_big_int_256 sei_int64 sei_hashval (sei_option sei_hashval) (sei_option sei_hashval))
+        i c
+    in
+    (LSState(blkh,dbh,lbk,ltx,currledgerroot,ov,vhv),c)
+  else if x = 1 then
+    let (tr,c) = sei_ctree i c in
+    (LSCTree(tr),c)
+  else if x = 2 then
+    (LSSuccess,c)
+  else
+    let (x,c) = i 1 c in
+    if x = 0 then
+      (LSFailed,c)
+    else
+      let (x,c) = i 2 c in
+      if x = 0 then
+        let (tr,c) = sei_htree sei_theory i c in
+        (LSTTree(tr),c)
+      else if x = 1 then
+        let (tr,c) = sei_htree (sei_prod (sei_option sei_hashval) sei_signa) i c in
+        (LSSTree(tr),c)
+      else
+        raise (Failure "not liteservmsg")
+
+let seo_liteclientmsg o lcm c =
+  match lcm with
+  | LCStateRequest ->
+     o 2 0 c
+  | LCCTreeRequest(lr,alpha) ->
+     let c = o 2 1 c in
+     seo_prod seo_hashval seo_addr o (lr,alpha) c
+  | LCSendTx(stau) ->
+     let c = o 2 2 c in
+     seo_stx o stau c
+  | LCTTreeRequest(h) ->
+     let c = o 2 3 c in
+     let c = o 2 0 c in
+     seo_hashval o h c
+  | LCSTreeRequest(h) ->
+     let c = o 2 3 c in
+     let c = o 2 1 c in
+     seo_hashval o h c
+
+let sei_liteclientmsg i c =
+  let (x,c) = i 2 c in
+  if x = 0 then
+    (LCStateRequest,c)
+  else if x = 1 then
+    let ((lr,alpha),c) = sei_prod sei_hashval sei_addr i c in
+    (LCCTreeRequest(lr,alpha),c)
+  else if x = 2 then
+    let (stau,c) = sei_stx i c in
+    (LCSendTx(stau),c)
+  else
+    let (x,c) = i 2 c in
+    if x = 0 then
+      let (h,c) = sei_hashval i c in
+      (LCTTreeRequest(h),c)
+    else if x = 1 then
+      let (h,c) = sei_hashval i c in
+      (LCSTreeRequest(h),c)
+    else
+      raise (Failure "not liteservmsg")
+
+let lite_req_ctree ledgerroot alpha =
+  let reqctree (s,sin,sout) =
+    seocf (seo_liteclientmsg seoc (LCCTreeRequest(ledgerroot,alpha)) (sout,None));
+    flush sout;
+    let (lsm,_) = sei_liteservmsg seic (sin,None) in
+    shutdown_close s;
+    match lsm with
+    | LSCTree(tr) -> Some(tr)
+    | _ -> None
+  in
+  match !Config.liteserveronion with
+  | Some(onion) ->
+     begin
+       let (s,sin,sout) = connectonionpeer !Config.socksport onion !Config.liteserverport in
+       reqctree (s,sin,sout)
+     end
+  | None ->
+     match !Config.liteserverip with
+     | Some(ip) ->
+        begin
+          let s = connectpeer ip !Config.liteserverport in
+          let sin = Unix.in_channel_of_descr s in
+          let sout = Unix.out_channel_of_descr s in
+          set_binary_mode_in sin true;
+          set_binary_mode_out sout true;
+          reqctree (s,sin,sout)
+        end
+     | None -> raise (Failure "Either liteserveronion or liteserverip must be set.")
+
+let lite_sendtx stau =
+  let sendtx (s,sin,sout) =
+    seocf (seo_liteclientmsg seoc (LCSendTx(stau)) (sout,None));
+    flush sout;
+    let (lsm,_) = sei_liteservmsg seic (sin,None) in
+    shutdown_close s;
+    match lsm with
+    | LSSuccess -> ()
+    | _ -> log_string (Printf.sprintf "lite server did not return success after sendtx")
+  in
+  match !Config.liteserveronion with
+  | Some(onion) ->
+     begin
+       let (s,sin,sout) = connectonionpeer !Config.socksport onion !Config.liteserverport in
+       sendtx (s,sin,sout)
+     end
+  | None ->
+     match !Config.liteserverip with
+     | Some(ip) ->
+        begin
+          let s = connectpeer ip !Config.liteserverport in
+          let sin = Unix.in_channel_of_descr s in
+          let sout = Unix.out_channel_of_descr s in
+          set_binary_mode_in sin true;
+          set_binary_mode_out sout true;
+          sendtx (s,sin,sout)
+        end
+     | None -> raise (Failure "Either liteserveronion or liteserverip must be set.")
 
 let thytree : (hashval,ttree) Hashtbl.t = Hashtbl.create 1000;;
 let sigtree : (hashval,stree) Hashtbl.t = Hashtbl.create 1000;;
@@ -132,8 +307,43 @@ let rec lookup_thytree thyroot =
 	    end
 	  else
 	    raise (Failure("fatal error trying to build theory tree; theory tree root mismatch expected " ^ (hashval_hexstring r) ^ " but got " ^ (match newroot with None -> "None" | Some(h) -> hashval_hexstring h)))
-	with Not_found ->
-	  raise (Failure("could not find theory tree with root " ^ (hashval_hexstring r) ^ " in the database"))
+	with
+        | Not_found ->
+           if not !Config.liteserver then
+             begin
+               let req_ttree (s,sin,sout) =
+                 seocf (seo_liteclientmsg seoc (LCTTreeRequest(r)) (sout,None));
+                 flush sout;
+                 let (lsm,_) = sei_liteservmsg seic (sin,None) in
+                 shutdown_close s;
+                 match lsm with
+                 | LSTTree(tr) ->
+                    Hashtbl.add thytree r tr;
+                    Some(tr)
+                 | _ ->
+                    raise (Failure (Printf.sprintf "Problem getting theory tree with root %s from the Proofgold Lite server." (hashval_hexstring r)))
+               in
+               match !Config.liteserveronion with
+               | Some(onion) ->
+                  begin
+                    let (s,sin,sout) = connectonionpeer !Config.socksport onion !Config.liteserverport in
+                    req_ttree (s,sin,sout)
+                  end
+               | None ->
+                  match !Config.liteserverip with
+                  | Some(ip) ->
+                     begin
+                       let s = connectpeer ip !Config.liteserverport in
+                       let sin = Unix.in_channel_of_descr s in
+                       let sout = Unix.out_channel_of_descr s in
+                       set_binary_mode_in sin true;
+                       set_binary_mode_out sout true;
+                       req_ttree (s,sin,sout)
+                     end
+                  | None -> raise (Failure "Either liteserveronion or liteserverip must be set.")
+             end
+           else
+	     raise (Failure("could not find theory tree with root " ^ (hashval_hexstring r) ^ " in the database"))
 
 let rec lookup_sigtree sigroot =
   match sigroot with
@@ -162,8 +372,43 @@ let rec lookup_sigtree sigroot =
 	    end
 	  else
 	    raise (Failure("fatal error trying to build signature tree; signature tree root mismatch expected " ^ (hashval_hexstring r) ^ " but got " ^ (match newroot with None -> "None" | Some(h) -> hashval_hexstring h)))
-	with Not_found ->
-	  raise (Failure("could not find signature tree with root " ^ (hashval_hexstring r) ^ " in the database"))
+	with
+        | Not_found ->
+           if not !Config.liteserver then
+             begin
+               let req_stree (s,sin,sout) =
+                 seocf (seo_liteclientmsg seoc (LCSTreeRequest(r)) (sout,None));
+                 flush sout;
+                 let (lsm,_) = sei_liteservmsg seic (sin,None) in
+                 shutdown_close s;
+                 match lsm with
+                 | LSSTree(tr) ->
+                    Hashtbl.add sigtree r tr;
+                    Some(tr)
+                 | _ ->
+                    raise (Failure (Printf.sprintf "Problem getting signature tree with root %s from the Proofgold Lite server." (hashval_hexstring r)))
+               in
+               match !Config.liteserveronion with
+               | Some(onion) ->
+                  begin
+                    let (s,sin,sout) = connectonionpeer !Config.socksport onion !Config.liteserverport in
+                    req_stree (s,sin,sout)
+                  end
+               | None ->
+                  match !Config.liteserverip with
+                  | Some(ip) ->
+                     begin
+                       let s = connectpeer ip !Config.liteserverport in
+                       let sin = Unix.in_channel_of_descr s in
+                       let sout = Unix.out_channel_of_descr s in
+                       set_binary_mode_in sin true;
+                       set_binary_mode_out sout true;
+                       req_stree (s,sin,sout)
+                     end
+                  | None -> raise (Failure "Either liteserveronion or liteserverip must be set.")
+             end
+           else           
+	     raise (Failure("could not find signature tree with root " ^ (hashval_hexstring r) ^ " in the database"))
 
 let rec get_all_theories t =
   match t with

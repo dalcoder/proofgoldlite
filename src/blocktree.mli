@@ -1,3 +1,4 @@
+(* Copyright (c) 2022 The Proofgold Lite developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
 (* Copyright (c) 2015-2016 The Qeditas developers *)
 (* Copyright (c) 2017-2019 The Dalilcoin developers *)
@@ -30,6 +31,7 @@ val stxpool : (hashval,stx) Hashtbl.t
 val unconfirmed_spent_assets : (hashval,hashval) Hashtbl.t
 
 val artificialledgerroot : hashval option ref
+val artificialblockheight : int64 ref
 val artificialbestblock : (hashval * hashval * hashval) option ref
 
 val delayed_headers : (hashval * hashval,Z.t -> unit) Hashtbl.t
@@ -94,3 +96,26 @@ val recursively_revalidate_blocks : hashval -> unit
 val reprocessblock : out_channel -> hashval -> hashval -> hashval -> unit
 
 val ensure_sync : unit -> unit
+
+type liteservmsg =
+  | LSState of int64 * hashval * hashval * hashval * hashval * (int64 * int64 * (hashval * int32) * (hashval * hashval) option * hashval) * (Z.t * int64 * hashval * hashval option * hashval option)
+  | LSCTree of ctree
+  | LSTTree of ttree
+  | LSSTree of stree
+  | LSSuccess
+  | LSFailed
+
+type liteclientmsg =
+  | LCStateRequest
+  | LCCTreeRequest of hashval * addr
+  | LCTTreeRequest of hashval
+  | LCSTreeRequest of hashval
+  | LCSendTx of stx
+
+val seo_liteservmsg : (int -> int -> 'a -> 'a) -> liteservmsg -> 'a -> 'a
+val sei_liteservmsg : (int -> 'a -> int * 'a) -> 'a -> liteservmsg * 'a
+val seo_liteclientmsg : (int -> int -> 'a -> 'a) -> liteclientmsg -> 'a -> 'a
+val sei_liteclientmsg : (int -> 'a -> int * 'a) -> 'a -> liteclientmsg * 'a
+
+val lite_req_ctree : hashval -> addr -> ctree option
+val lite_sendtx : stx -> unit

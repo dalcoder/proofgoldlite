@@ -99,6 +99,157 @@ let fstohash a =
 let stkth : Thread.t option ref = ref None;;
 let swpth : Thread.t option ref = ref None;;
 
+let lite_th : Thread.t option ref = ref None;;
+
+let lite_server () =
+  let liteserver_loop ls =
+    let efn = !exitfn in
+    exitfn := (fun n -> shutdown_close ls; efn n);
+    while true do
+      try
+        Thread.delay 1.0;
+        let (s,a) = Unix.accept ls in
+        try
+          let sin = Unix.in_channel_of_descr s in
+          let sout = Unix.out_channel_of_descr s in
+          set_binary_mode_in sin true;
+          set_binary_mode_out sout true;
+          let (lmsg,_) = sei_liteclientmsg seic (sin,None) in
+          match lmsg with
+          | LCStateRequest ->
+             begin
+               let (best,_) = get_bestblock () in
+               match best with
+               | None ->
+                  seocf (seo_liteservmsg seoc (LSFailed) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 2.0
+               | Some(dbh,lbk,ltx) ->
+	          let currledgerroot = get_ledgerroot best in
+                  let lbkltx = hashpair lbk ltx in
+	          let (_,tm1,burned,lutxo,prev,stkmod,blkh) = Db_outlinevals.dbget lbkltx in
+                  let (tinfo,tm2,lr,tr,sr) = Db_validheadervals.dbget lbkltx in
+                  seocf (seo_liteservmsg seoc (LSState(blkh,dbh,lbk,ltx,currledgerroot,(tm1,burned,lutxo,prev,stkmod),(tinfo,tm2,lr,tr,sr))) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 1.0
+             end
+          | LCCTreeRequest(lr,alpha) ->
+             begin
+               match octree_reduce_to_min_support [] [] [addr_bitseq alpha] (Some(CHash(lr))) with
+               | None ->
+                  seocf (seo_liteservmsg seoc (LSFailed) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 2.0
+               | Some(c) ->
+                  seocf (seo_liteservmsg seoc (LSCTree(c)) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 1.0
+             end
+          | LCTTreeRequest(h) ->
+             let tr = lookup_thytree (Some(h)) in
+             begin
+               match tr with
+               | Some(tr) ->
+                  seocf (seo_liteservmsg seoc (LSTTree(tr)) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 1.0
+               | None ->
+                  seocf (seo_liteservmsg seoc (LSFailed) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 1.0
+             end
+          | LCSTreeRequest(h) ->
+             let tr = lookup_sigtree (Some(h)) in
+             begin
+               match tr with
+               | Some(tr) ->
+                  seocf (seo_liteservmsg seoc (LSSTree(tr)) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 1.0
+               | None ->
+                  seocf (seo_liteservmsg seoc (LSFailed) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 1.0
+             end
+          | LCSendTx(stau) ->
+             begin
+               let (best,_) = get_bestblock () in
+               match best with
+               | None ->
+                  seocf (seo_liteservmsg seoc (LSFailed) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 2.0
+               | Some(dbh,lbk,ltx) ->
+	          let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+		  let (_,tm,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
+                  Commands.sendtx2 !Utils.log (Int64.add 1L blkh) tm tr sr lr 20000 stau; (* fake length *)
+                  seocf (seo_liteservmsg seoc (LSSuccess) (sout,None));
+                  flush sout;
+                  shutdown_close s; Thread.delay 1.0
+             end
+        with _ ->
+          shutdown_close s; Thread.delay 5.0
+      with _ ->
+        Thread.delay 10.0
+    done
+  in
+  begin
+    match !Config.liteserveronion with
+    | Some(onion) ->
+       let ls = openonionlistener onion !Config.liteserverport !Config.liteserverport 5 in
+       liteserver_loop ls
+    | None ->
+       match !Config.liteserverip with
+       | Some(ip) ->
+          let ls = openlistener ip !Config.liteserverport 5 in
+          liteserver_loop ls
+       | None ->
+          Printf.printf "Either liteserveronion or liteserverip must be set.\n";
+          !exitfn 1
+  end
+
+let lite_client () =
+  let litestate_2 (s,sin,sout) =
+    seocf (seo_liteclientmsg seoc (LCStateRequest) (sout,None));
+    flush sout;
+    let (lsm,_) = sei_liteservmsg seic (sin,None) in
+    shutdown_close s;
+    match lsm with
+    | LSState(blkh,dbh,lbk,ltx,currledgerroot,(tm1,burned,lutxo,prev,stkmod),vhv) ->
+       artificialbestblock := Some(dbh,lbk,ltx);
+       artificialblockheight := blkh;
+       artificialledgerroot := Some(currledgerroot);
+       let lbkltx = hashpair lbk ltx in
+       Db_outlinevals.dbput lbkltx (dbh,tm1,burned,lutxo,prev,stkmod,blkh);
+       Db_validheadervals.dbput lbkltx vhv;
+    | _ ->
+       log_string (Printf.sprintf "unexpected reply for state request from lite server\n")
+  in
+  while true do
+    begin
+      match !Config.liteserveronion with
+      | Some(onion) ->
+         begin
+           let (s,sin,sout) = connectonionpeer !Config.socksport onion !Config.liteserverport in
+           litestate_2 (s,sin,sout)
+         end
+      | None ->
+         match !Config.liteserverip with
+         | Some(ip) ->
+            begin
+              let s = connectpeer ip !Config.liteserverport in
+              let sin = Unix.in_channel_of_descr s in
+              let sout = Unix.out_channel_of_descr s in
+              set_binary_mode_in sin true;
+              set_binary_mode_out sout true;
+              litestate_2 (s,sin,sout)
+            end
+         | None ->
+            log_string (Printf.sprintf "Either liteserveronion or liteserverip must be set.\n")
+    end;
+    Thread.delay 120.0
+  done
+
 let ltc_listener_th : Thread.t option ref = ref None;;
 
 let ltc_init sout =
@@ -5818,6 +5969,10 @@ let initialize () =
     let n = rand_int64() in
     this_nodes_nonce := n;
     log_string (Printf.sprintf "Nonce: %Ld\n" n);
+    if !Config.liteserver then
+      lite_th := Some(Thread.create lite_server ())
+    else
+      lite_th := Some(Thread.create lite_client ())
   end;;
 
 exception Skip

@@ -1,3 +1,4 @@
+(* Copyright (c) 2022 The Proofgold Lite developers *)
 (* Copyright (c) 2020-2021 The Proofgold Core developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
 (* Copyright (c) 2015-2016 The Qeditas developers *)
@@ -1016,6 +1017,33 @@ let assets_at_address_in_ledger_json raiseempty alpha par ledgerroot blkh =
 
 let printassets_in_ledger oc ledgerroot blkhght =
   let ctr = Ctre.CHash(ledgerroot) in
+  if not !liteserver then
+    begin
+      let g alpha =
+        try
+          ignore (Ctre.ctree_addr true false alpha ctr None);
+        with Not_found ->
+          match lite_req_ctree ledgerroot alpha with
+          | Some(tr) -> ignore (save_ctree_atoms tr)
+          | None -> ()
+      in
+      List.iter
+        (fun (k,b,(x,y),w,h,z) -> g (p2pkhaddr_addr h))
+        !walletkeys_staking;
+      List.iter
+        (fun (k,b,(x,y),w,h,z) -> g (p2pkhaddr_addr h))
+        !walletkeys_nonstaking;
+      List.iter
+        (fun (h,z,scr) -> g (p2shaddr_addr h))
+        !walletp2shs;
+      List.iter
+        (fun (alpha,beta,(x,y),recid,fcomp,esg) ->
+          let alpha2 = payaddr_addr alpha in
+          g alpha2)
+        !walletendorsements;
+      List.iter g !walletwatchaddrs;
+      List.iter g !walletwatchaddrs_offlinekey;
+    end;
   let warned = ref false in
   let al1 = ref [] in
   let tot1 = ref 0L in
@@ -1155,7 +1183,7 @@ let printassets_in_ledger oc ledgerroot blkhght =
 let printassets oc =
   match !artificialledgerroot with
   | Some(ledgerroot) ->
-      printassets_in_ledger oc ledgerroot (-1L)
+     printassets_in_ledger oc ledgerroot !artificialblockheight
   | None ->
       try
 	let (b,cwl) = get_bestblock() in
@@ -2614,7 +2642,10 @@ let sendtx2 oc blkh tm tr sr lr txbytes stau =
 	      if fee >= minfee then
 		begin
 		  savetxtopool_real stxh stau;
-		  publish_stx stxh stau;
+                  if !liteserver then
+		    publish_stx stxh stau
+                  else
+                    lite_sendtx stau;
 		  Printf.fprintf oc "%s\n" (hashval_hexstring stxh);
 		end
 	      else
@@ -2633,7 +2664,10 @@ let sendtx2 oc blkh tm tr sr lr txbytes stau =
 	| (None,None) ->
 	    let stxh = hashstx stau in
 	    savetxtopool_real stxh stau;
-	    publish_stx stxh stau;
+            if !liteserver then
+	      publish_stx stxh stau
+            else
+              lite_sendtx stau;
 	    Printf.fprintf oc "%s\n" (hashval_hexstring stxh);
 	    flush stdout;
 	| (Some(bh2),None) ->
