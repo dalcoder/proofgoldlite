@@ -4,7 +4,70 @@ Proofgold Lite is a fork of the Proofgold Core software.
 When run in server mode, it is a full node that also offers
 extra services to other Proofgold Lite clients.
 
-# proofgold
+To run Proofgold Lite as a server, set
+
+liteserver=1
+
+in your proofgold.conf file in your data directory.
+By default Proofgold Lite runs as a client (with liteserver=0).
+Running Proofgold Lite requires everything required to run
+Proofgold Core along with the requirement to either
+set liteserverip to an ip address or liteserveronion to an onion address.
+This can be done in the proofgold.conf file by including
+
+liteserverip=<your ip address>
+
+or
+
+liteserveronion=<your onion address>
+
+You will need to listen on the port identified by the configuration
+variable liteserverport (by default 21833). This can be changed by including
+
+liteserverport=<port num>
+
+in your proofgold.conf file. You will need to find some way to advertize
+to potential Proofgold Lite clients your ip/onion address and port if you want them
+to use your server.
+
+A Proofgold Lite client can choose the server they connect to by
+setting liteserverip or liteserveronion in their proofgold.conf file
+to the server's ip or onion address, as indicated above. If the port
+is not 21833, then liteserverport will also need to be set by the
+client. By default, the onion address
+7xd5mhkph2oqmt3c44mtcgsqb2swhhqktfj6fczhn23ffubt63tw7cad.onion
+with port 21833 is used as the server. If this server goes down,
+then Proofgold Lite clients must set the configuration variables
+to values for a new server of their choice.
+
+Many Proofgold Core commands work differently for Proofgold Lite clients.
+Here are some important differences:
+
+ltcstatus : The Lite client does not have full ltcstatus, but will likely
+know the latest Proofgold block and how it was burned into the LTC chain.
+
+printassets : If the Lite client does not have enough of the current ledger
+tree to view the assets in addresses in the Lite client's wallet, then
+more of the ledger tree will be requested from the server. This will be
+saved locally in the data directory so that future printassets calls
+should be faster. Similarly other commands may request more of the ledger tree,
+including sendtoaddress, createtx, readdraft, etc.
+
+sendtx, sendtxfile: Lite clients are only connected to the Lite server of
+their choice, and not to other Proofgold nodes. Commands to send transactions
+request the Proofgold Lite server to send the transaction to the network.
+
+One new command is important:
+
+delegatestake : This command can be used to consolidate 100 bars or more from
+the Lite clients wallet and place it into a third party's address while maintaining
+ownership of the asset. The third party will be able to use the asset to stake.
+The Lite client will still see the asset in their watch wallet. If no lock height
+was given to delegate stake, the Lite client will always be able to spend the asset
+using the commands createtx, signtx and sendtx. If a lock height was given,
+then the Lite client will be able to spend the asset after that height passes.
+
+# The information below is from the README for Proofgold Core, with minor modifications
 
 Proofgold is a cryptocurrency that rewards the best theorem provers.
 Information about proofgold can be found at proofgold.org.
@@ -59,7 +122,7 @@ you might need to use makevmbytecode to obtain
 an executable that works as intended.
 
 The configure script can be given some parameters.
-For example, the default data directory is .proofgold in the
+For example, the default data directory is .proofgoldlite in the
 user's home directory. This can be changed as follows:
 
 ```
