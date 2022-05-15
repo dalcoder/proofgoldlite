@@ -209,6 +209,7 @@ let lite_server () =
   end
 
 let lite_client () =
+  let failcnt = ref 0 in
   let litestate_2 (s,sin,sout) =
     seocf (seo_liteclientmsg seoc (LCStateRequest) (sout,None));
     flush sout;
@@ -222,6 +223,7 @@ let lite_client () =
        let lbkltx = hashpair lbk ltx in
        Db_outlinevals.dbput lbkltx (dbh,tm1,burned,lutxo,prev,stkmod,blkh);
        Db_validheadervals.dbput lbkltx vhv;
+       failcnt := 0
     | _ ->
        log_string (Printf.sprintf "unexpected reply for state request from lite server\n")
   in
@@ -230,19 +232,55 @@ let lite_client () =
       match !Config.liteserveronion with
       | Some(onion) ->
          begin
-           let (s,sin,sout) = connectonionpeer !Config.socksport onion !Config.liteserverport in
-           litestate_2 (s,sin,sout)
+           try
+             let (s,sin,sout) = connectonionpeer !Config.socksport onion !Config.liteserverport in
+             litestate_2 (s,sin,sout)
+           with _ ->
+             if not !Config.daemon then
+               if !failcnt < 3 then
+                 begin
+                   Printf.printf "WARNING: Problem connecting to Proofgold Lite server at %s:%d\nWill try again in 2 minutes.\n" onion !Config.liteserverport;
+                   flush stdout;
+                   incr failcnt
+                 end
+               else
+                 begin
+                   Printf.printf "WARNING: Problem connecting to Proofgold Lite server at %s:%d\nGiving up.\n" onion !Config.liteserverport;
+                   flush stdout;
+                   !exitfn 1
+                 end
+             else
+               !exitfn 1;
+             Thread.delay 120.0;
          end
       | None ->
          match !Config.liteserverip with
          | Some(ip) ->
             begin
-              let s = connectpeer ip !Config.liteserverport in
-              let sin = Unix.in_channel_of_descr s in
-              let sout = Unix.out_channel_of_descr s in
-              set_binary_mode_in sin true;
-              set_binary_mode_out sout true;
-              litestate_2 (s,sin,sout)
+              try
+                let s = connectpeer ip !Config.liteserverport in
+                let sin = Unix.in_channel_of_descr s in
+                let sout = Unix.out_channel_of_descr s in
+                set_binary_mode_in sin true;
+                set_binary_mode_out sout true;
+                litestate_2 (s,sin,sout)
+              with _ ->
+                if not !Config.daemon then
+                  if !failcnt < 3 then
+                    begin
+                      Printf.printf "WARNING: Problem connecting to Proofgold Lite server at %s:%d\nWill try again in 2 minutes.\n" ip !Config.liteserverport;
+                      flush stdout;
+                      incr failcnt
+                    end
+                  else
+                    begin
+                      Printf.printf "WARNING: Problem connecting to Proofgold Lite server at %s:%d\nGiving up.\n" ip !Config.liteserverport;
+                      flush stdout;
+                      !exitfn 1
+                    end
+                else
+                  !exitfn 1;
+                Thread.delay 120.0;
             end
          | None ->
             log_string (Printf.sprintf "Either liteserveronion or liteserverip must be set.\n")
@@ -405,6 +443,40 @@ let consolidate_spendable oc blkh lr amt esttxsize gathered gatheredkeys gathere
     raise CouldNotConsolidate
   with Exit -> ();;
 
+let ctree_lookup_addr_assets_lsreq c bl =
+  if !Config.liteserver then
+    ctree_lookup_addr_assets true true c bl
+  else
+    try
+      ctree_lookup_addr_assets true false c bl
+    with Not_found ->
+          match c with
+          | CHash(lr) ->
+             begin
+               let alpha = bitseq_addr bl in
+               match lite_req_ctree lr alpha with
+               | Some(tr) ->
+                  ignore (save_ctree_atoms tr);
+                  ctree_lookup_addr_assets true false c bl
+               | None -> raise Not_found
+             end
+          | _ -> raise Not_found;;
+
+let ctree_lookup_addr_assets_lsreq_alr alpha =
+  if not !Config.liteserver then
+    match !artificialledgerroot with
+    | None -> raise Not_found
+    | Some(lr) ->
+       let bl = addr_bitseq alpha in
+       let c = CHash(lr) in
+       try
+         ignore (ctree_lookup_addr_assets true false c bl)
+       with Not_found ->
+             match lite_req_ctree lr alpha with
+             | Some(tr) ->
+                ignore (save_ctree_atoms tr)
+             | None -> raise Not_found;;
+     
 let swappingthread () =
   log_string (Printf.sprintf "swapping thread %d begin %f\n" (Thread.id (Thread.self())) (Unix.gettimeofday()));
   let change = ref false in
@@ -871,7 +943,7 @@ let local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy =
   try
     Hashtbl.find remgvtpth oidthy
   with Not_found ->
-    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
     match hlist_lookup_obj_owner true true true oidthy hl with
     | None -> raise Not_found
     | Some(beta,r) -> (beta,r);;
@@ -880,7 +952,7 @@ let local_lookup_prop_thy_owner lr remgvknth pidthy alphathy =
   try
     Hashtbl.find remgvknth pidthy
   with Not_found ->
-    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
     match hlist_lookup_prop_owner true true true pidthy hl with
     | None -> raise Not_found
     | Some(beta,r) -> (beta,r);;
@@ -888,6 +960,10 @@ let local_lookup_prop_thy_owner lr remgvknth pidthy alphathy =
 let ac c h longhelp f =
   sortedcommands := List.merge compare [c] !sortedcommands;
   Hashtbl.add commandh c (h,longhelp,(fun oc al -> try f oc al with BadCommandForm -> Printf.fprintf oc "%s\n" h));;
+
+let aclsc c h longhelp f g =
+  sortedcommands := List.merge compare [c] !sortedcommands;
+  Hashtbl.add commandh c (h,longhelp,(fun oc al -> try if !Config.liteserver then f oc al else g oc al with BadCommandForm -> Printf.fprintf oc "%s\n" h));;
 
 let validusername_p u =
   if u = "" || String.length u > 32 then
@@ -1111,7 +1187,7 @@ let rec find_marker_in_hlist hl =
       find_marker_in_hlist (get_hlist_element h)
 
 let find_marker_at_address tr beta =
-  let hl = ctree_lookup_addr_assets true true tr (addr_bitseq beta) in
+  let hl = ctree_lookup_addr_assets_lsreq tr (addr_bitseq beta) in
   find_marker_in_hlist hl
 
 let initialize_commands () =
@@ -1123,6 +1199,67 @@ let initialize_commands () =
       match al with
       | [h] -> (try ltc_listener_paused := true; retractltcblock h; !exitfn 0 with e -> Printf.fprintf oc "%s\n" (Printexc.to_string e); !exitfn 7)
       | _ -> raise BadCommandForm);
+  ac "delegatestake" "delegatestake <address> <bars> [<lockheight>]" "delegatestake is a command for placing bars at an external address for staking (but still spendable by the local wallet).\nIt consolidates enough spendable utxos to send the given number of bars to the given external address for staking, using one of the current addresses as the lock address.\nIf lockheight is not given, then height 1 will be used, meaning the asset will be unlocked.\nIf a lockheight is given, then the new asset is locked until the given height."
+    (fun oc al ->
+      let (a,v,lh) =
+        match al with
+        | [a;v] ->
+           (a,v,1L)
+        | [a;v;lh] ->
+           (a,v,Int64.of_string lh)
+        | _ -> raise BadCommandForm
+      in
+      let gamma = pfgaddrstr_addr a in
+      if not (p2pkhaddr_p gamma) then (Printf.fprintf oc "%s is not a p2pkh address, which is the only kind allowed for staking.\n" a; raise BadCommandForm);
+      let amt = Cryptocurr.atoms_of_bars v in
+      if amt < 10000000000000L then (Printf.fprintf oc "At least 100 bars is required to delegate for staking.\n"; raise BadCommandForm);
+      ignore (ctree_lookup_addr_assets_lsreq_alr gamma); (* to ensure we will have enough of the ledger tree so we can validate the tx *)
+      Commands.importwatchaddr oc a "";
+      let esttxsize = ref 500 in
+      let gathered = ref 0L in
+      let gatheredkeys = ref [] in
+      let gatheredassets = ref [] in
+      let txinlr = ref [] in
+      begin
+	let (blkh,tm,lr,tr,sr) =
+	  match get_bestblock_print_warnings oc with
+	  | None -> raise Not_found
+	  | Some(dbh,lbk,ltx) ->
+	     let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+	     let (_,tm,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
+	     (blkh,tm,lr,tr,sr)
+	in
+	try
+          consolidate_spendable oc blkh lr amt esttxsize gathered gatheredkeys gatheredassets txinlr;
+	  let minfee = Int64.mul (Int64.of_int !esttxsize) !Config.defaulttxfee in
+	  let change = Int64.sub !gathered (Int64.add amt minfee) in
+          let newpreasset = Currency(amt) in
+          let alpha =
+            match !gatheredkeys with
+            | (_,_,_,h)::_ -> h
+            | _ -> raise (Failure "could not determine a local address with a key")
+          in
+          let obl = Some(p2pkhaddr_payaddr alpha,lh,false) in
+	  let txoutl =
+	    if change >= 10000L then
+	      [(gamma,(obl,newpreasset));(p2pkhaddr_addr alpha,(None,Currency(change)))]
+	    else
+	      [(gamma,(obl,newpreasset))]
+	  in
+	  let stau = ((!txinlr,txoutl),([],[])) in
+	  let (stau,ci,co) = Commands.signtx2 oc lr stau [] [] (Some(!gatheredkeys)) in
+	  if (ci && co) then
+            begin
+	      Commands.sendtx2 oc blkh tm tr sr lr (stxsize stau) stau;
+              List.iter
+                (fun (alpha,aid) -> Hashtbl.add unconfirmedspentutxo (lr,aid) ())
+                !txinlr
+            end
+	  else
+	    Printf.fprintf oc "Transaction was created but only partially signed and so was not sent.\n"
+	with CouldNotConsolidate ->
+	  Printf.fprintf oc "Could not consolidate enough spendable currency to delegate %s to address %s\n" v a
+      end);
   ac "sendtoaddress" "sendtoaddress <address> <bars> [<lockheight>]" "Consolidate enough spendable utxos to send the given number of bars to the given address.\nIf the address is a term address, then the bars are put as a bounty.\nIf a lockheight is given and the address is a pay address,\n then the new asset is locked until the given height."
     (fun oc al ->
       let (a,v,lh) =
@@ -1134,6 +1271,7 @@ let initialize_commands () =
         | _ -> raise BadCommandForm
       in
       let gamma = pfgaddrstr_addr a in
+      ignore (ctree_lookup_addr_assets_lsreq_alr gamma); (* to ensure we will have enough of the ledger tree so we can validate the tx *)
       if pubaddr_p gamma then (Printf.fprintf oc "%s is a publication address, so neither currency nor bounty can be sent there.\n" a; raise BadCommandForm);
       let amt = Cryptocurr.atoms_of_bars v in
       let esttxsize = ref 500 in
@@ -1483,7 +1621,7 @@ let initialize_commands () =
 				    let alphathy = hashval_term_addr pidthy in
 				    let nm = pname pidpure in
 				    begin
-				      let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+				      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 				      match hlist_lookup_prop_owner true true true pidpure hl with
 				      | None ->
 					  begin
@@ -1520,7 +1658,7 @@ let initialize_commands () =
 						else
 						  (Printf.sprintf "Declaring the proposition as Known without proving it would cost %Ld atoms; consider this" r))
 				    end;
-				    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+				    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
 				    begin
 				      match hlist_lookup_prop_owner true true true pidthy hl with
 				      | None ->
@@ -1579,7 +1717,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
 		  let alpha = hashval_term_addr oid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_obj_owner true true true oid hl with
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
@@ -1590,7 +1728,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let pid = hashtag (hashopair2 th k) 33l in
 		  let alpha = hashval_term_addr pid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
@@ -1638,7 +1776,7 @@ let initialize_commands () =
 			  (match r with
 			  | Some(0L) -> "free to use"
 			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			match hlist_lookup_obj_owner true true true oidpure hl with
 			| None ->
 			    refusesig := true;
@@ -1670,7 +1808,7 @@ let initialize_commands () =
 			  (match r with
 			  | Some(0L) -> "free to use"
 			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			match hlist_lookup_prop_owner true true true pidpure hl with
 			| None ->
 			    Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
@@ -1706,7 +1844,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
 		  let alpha = hashval_term_addr oid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_obj_owner true true true oid hl with
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
@@ -1717,7 +1855,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let pid = hashtag (hashopair2 th k) 33l in
 		  let alpha = hashval_term_addr pid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
@@ -1765,7 +1903,7 @@ let initialize_commands () =
 			  (match r with
 			  | None -> "No right to use; document cannot be published unless this is redefined.\n"
 			  | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
-			let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			match hlist_lookup_obj_owner true true true oidpure hl with
 			| None ->
 			    Printf.fprintf oc "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **\n"
@@ -1795,7 +1933,7 @@ let initialize_commands () =
 			  (match r with
 			  | None -> "No right to use; document cannot be published unless this is reproven."
 			  | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
-			let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			match hlist_lookup_prop_owner true true true pidpure hl with
 			| None ->
 			    Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
@@ -1818,7 +1956,7 @@ let initialize_commands () =
 		      let oidthy = hashtag (hashopair2 th (hashpair h k)) 32l in
 		      let alphapure = hashval_term_addr oidpure in
 		      let alphathy = hashval_term_addr oidthy in
-		      let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 		      let nm = oname oidpure in
 		      begin
 			match hlist_lookup_obj_owner true true true oidpure hl with
@@ -1846,7 +1984,7 @@ let initialize_commands () =
 				  else
 				    (Printf.sprintf "Using the object without defining it would cost %Ld atoms; consider changing Def to Param %s if the definition is not needed" r (hashval_hexstring oidpure)))
 		      end;
-		      let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
 		      begin
 			match hlist_lookup_obj_owner true true true oidthy hl with
 			| None ->
@@ -1881,7 +2019,7 @@ let initialize_commands () =
 		      let pidthy = hashtag (hashopair2 th h) 33l in
 		      let alphapure = hashval_term_addr pidpure in
 		      let alphathy = hashval_term_addr pidthy in
-		      let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 		      let nm = pname pidpure in
 		      begin
 			match hlist_lookup_prop_owner true true true pidpure hl with
@@ -1920,7 +2058,7 @@ let initialize_commands () =
 				  else
 				    (Printf.sprintf "Declaring the proposition as Known without proving it would cost %Ld atoms; consider this" r))
 		      end;
-		      let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
 		      begin
 			match hlist_lookup_prop_owner true true true pidthy hl with
 			| None ->
@@ -1963,7 +2101,7 @@ let initialize_commands () =
 		  List.iter
 		    (fun alphathy ->
 		      Printf.fprintf oc "%s\n" (addr_pfgaddrstr alphathy);
-		      let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
 		      if hlist_lookup_neg_prop_owner true true true hl then
 			Printf.fprintf oc "The negated proposition already has an owner.\n"
 		      else
@@ -2096,7 +2234,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
 		  let alpha = hashval_term_addr oid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_obj_owner true true true oid hl with
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
@@ -2107,7 +2245,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let pid = hashtag (hashopair2 th k) 33l in
 		  let alpha = hashval_term_addr pid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
@@ -2153,7 +2291,7 @@ let initialize_commands () =
 			  (match r with
 			  | Some(0L) -> "free to use"
 			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			match hlist_lookup_obj_owner true true true oidpure hl with
 			| None ->
 			    refusesig := true;
@@ -2185,7 +2323,7 @@ let initialize_commands () =
 			  (match r with
 			  | Some(0L) -> "free to use"
 			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			match hlist_lookup_prop_owner true true true pidpure hl with
 			| None ->
 			    Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
@@ -2235,7 +2373,7 @@ let initialize_commands () =
 	    let (dl,nonce,gamma,_,_,_,_,_,_,_,_,_,_) = input_doc ch th sgt in
 	    let doch = hashdoc dl in
 	    let alphadoc = hashval_pub_addr (hashopair2 th doch) in
-	    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphadoc) in
+	    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphadoc) in
 	    match hlist_lookup_asset_gen true true true (fun a -> match a with (_,_,_,DocPublication(_,_,_,_)) -> true | _ -> false) hl with
 	    | Some(aid,_,_,_) ->
 		Printf.fprintf oc "Document has already been published: address %s asset id %s\n" (Cryptocurr.addr_pfgaddrstr alphadoc) (hashval_hexstring aid)
@@ -2248,7 +2386,7 @@ let initialize_commands () =
 		    if th1 = th then
 		      let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
 		      let alpha = hashval_term_addr oid in
-		      let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		      match hlist_lookup_obj_owner true true true oid hl with
 		      | None -> false
 		      | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
@@ -2259,7 +2397,7 @@ let initialize_commands () =
 		    if th1 = th then
 		      let pid = hashtag (hashopair2 th k) 33l in
 		      let alpha = hashval_term_addr pid in
-		      let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		      match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
 		      | None -> false
 		      | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
@@ -2287,7 +2425,7 @@ let initialize_commands () =
 			      (match r with
 			      | None -> refusecommit := true; "No right to use; document cannot be published unless this is redefined.\n"
 			      | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
-			    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			    match hlist_lookup_obj_owner true true true oidpure hl with
 			    | None ->
 				Printf.fprintf oc "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **\n"
@@ -2317,7 +2455,7 @@ let initialize_commands () =
 			      (match r with
 			      | None -> refusecommit := true; "No right to use; document cannot be published unless this is reproven."
 			      | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
-			    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			    match hlist_lookup_prop_owner true true true pidpure hl with
 			    | None ->
 				Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
@@ -2425,7 +2563,7 @@ let initialize_commands () =
 							with Not_found -> (gamma1p,Some(0L))
 						      in
                                                       begin
-				                        let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+				                        let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 				                        match hlist_lookup_prop_owner true true true pidpure hl with
                                                         | Some(_,_) -> () (** pure version already owned **)
 				                        | None -> (** pure version not owned yet **)
@@ -2488,7 +2626,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
 		  let alpha = hashval_term_addr oid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_obj_owner true true true oid hl with
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
@@ -2499,7 +2637,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let pid = hashtag (hashopair2 th k) 33l in
 		  let alpha = hashval_term_addr pid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
@@ -2512,7 +2650,7 @@ let initialize_commands () =
 	      | Some((tml,knl),imported) ->
 		  let id = hashopair2 th (hashsigna (signaspec_signa signaspec)) in
 		  let delta = hashval_pub_addr id in
-		  let hldelta = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq delta) in
+		  let hldelta = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq delta) in
 		  if not (hldelta = HNil) then raise (Failure "Signature already seems to have been published.");
 		  Printf.fprintf oc "Signature is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr (hashval_pub_addr id));
 		  Printf.fprintf oc "Signature imports %d signatures:\n" (List.length imported);
@@ -2548,7 +2686,7 @@ let initialize_commands () =
 			  (match r with
 			  | Some(0L) -> "free to use"
 			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			match hlist_lookup_obj_owner true true true oidpure hl with
 			| None ->
 			    refusesig := true;
@@ -2580,7 +2718,7 @@ let initialize_commands () =
 			  (match r with
 			  | Some(0L) -> "free to use"
 			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 			match hlist_lookup_prop_owner true true true pidpure hl with
 			| None ->
 			    Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
@@ -2668,7 +2806,7 @@ let initialize_commands () =
 	    let (dl,nonce,gamma,paramh,objhrev,proph,prophrev,conjh,objownsh,objrightsh,propownsh,proprightsh,bountyh) = input_doc ch th sgt in
 	    let id = hashopair2 th (hashdoc dl) in
 	    let delta = hashval_pub_addr id in
-	    let hldelta = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq delta) in
+	    let hldelta = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq delta) in
 	    if not (hldelta = HNil) then raise (Failure "Document already seems to have been published.");
 	    begin
 	      let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
@@ -2677,7 +2815,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
 		  let alpha = hashval_term_addr oid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_obj_owner true true true oid hl with
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
@@ -2688,7 +2826,7 @@ let initialize_commands () =
 		if th1 = th then
 		  let pid = hashtag (hashopair2 th k) 33l in
 		  let alpha = hashval_term_addr pid in
-		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
 		  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
 		  | None -> false
 		  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
@@ -2769,7 +2907,7 @@ let initialize_commands () =
 					    | _ -> ()
 					  end;
 					  begin
-					    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+					    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 					    match hlist_lookup_obj_owner true true true oidpure hl with
 					    | None -> raise (Failure (Printf.sprintf "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **" (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)))
 					    | Some(beta,r) ->
@@ -2814,7 +2952,7 @@ let initialize_commands () =
 					    | _ -> ()
 					  end;
 					  begin
-					    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+					    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 					    match hlist_lookup_prop_owner true true true pidpure hl with
 					    | None -> raise (Failure (Printf.sprintf "** Somehow the theory proposition has an owner but the pure object %s (%s) did not. Invariant failure. **" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)))
 					    | Some(beta,r) ->
@@ -2878,7 +3016,7 @@ let initialize_commands () =
 					  let oidthy = hashtag (hashopair2 th (hashpair h k)) 32l in
 					  let alphapure = hashval_term_addr oidpure in
 					  let alphathy = hashval_term_addr oidthy in
-					  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+					  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 					  begin
 					    match hlist_lookup_obj_owner true true true oidpure hl with
 					    | Some(_) -> ()
@@ -2887,7 +3025,7 @@ let initialize_commands () =
 						let (delta2,r) = try Hashtbl.find objrightsh (false,oidpure) with Not_found -> (gammap,Some(0L)) in
 						txoutlr := (alphapure,(Some(delta1,0L,false),OwnsObj(oidpure,delta2,r)))::!txoutlr
 					  end;
-					  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+					  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
 					  begin
 					    match hlist_lookup_obj_owner true true true oidthy hl with
 					    | Some(_) -> ()
@@ -2902,7 +3040,7 @@ let initialize_commands () =
 					  let pidthy = hashtag (hashopair2 th pidpure) 33l in
 					  let alphapure = hashval_term_addr pidpure in
 					  let alphathy = hashval_term_addr pidthy in
-					  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+					  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
 					  begin
 					    match hlist_lookup_prop_owner true true true pidpure hl with
 					    | Some(_) -> ()
@@ -2911,7 +3049,7 @@ let initialize_commands () =
 						let (delta2,r) = try Hashtbl.find proprightsh (false,pidpure) with Not_found -> (gammap,Some(0L)) in
 						txoutlr := (alphapure,(Some(delta1,0L,false),OwnsProp(pidpure,delta2,r)))::!txoutlr
 					  end;
-					  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+					  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
 					  begin
 					    match hlist_lookup_prop_owner true true true pidthy hl with
 					    | Some(_) -> ()
@@ -2994,7 +3132,7 @@ let initialize_commands () =
 	      let (_,_,lr,_,_) = Db_validheadervals.dbget (hashpair lbk ltx) in
               List.iter
                 (fun (id1,alpha1) ->
-                  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha1) in
+                  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha1) in
                   let al2 =
                     hlist_filter_assets_gen true true
                       (fun a ->
@@ -3037,7 +3175,7 @@ let initialize_commands () =
                 addrh;
               List.iter
                 (fun (id1,alpha1) ->
-                  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha1) in
+                  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha1) in
                   let al2 =
                     hlist_filter_assets_gen true true
                       (fun a ->
@@ -3563,7 +3701,7 @@ let initialize_commands () =
 	with e -> Printf.fprintf f "Exception: %s\n" (Printexc.to_string e)
       end;
       close_out_noerr f);
-  ac "ltcstatus" "ltcstatus [<ltcblockhash>]" "Print the proofgold blocks burned into the ltc blockchain from the past week.\nThe topmost is the current best block."
+  aclsc "ltcstatus" "ltcstatus [<ltcblockhash>]" "Print the proofgold blocks burned into the ltc blockchain from the past week.\nThe topmost is the current best block."
     (fun oc al ->
       let h =
 	match al with
@@ -3608,7 +3746,14 @@ let initialize_commands () =
 		  else
 		    Printf.fprintf oc "* %s (missing header) %s %s %Ld %Ld\n" (hashval_hexstring dbh) (hashval_hexstring lbh) (hashval_hexstring ltx) ltm lhght)
 	    zl)
-	zll);
+	zll)
+    (fun oc al ->
+      Printf.fprintf oc "The full ltcstatus command is not available for Lite clients.\n";
+      match !artificialbestblock with
+      | Some(dbh,lbk,ltx) ->
+         Printf.fprintf oc "Current best block: %s\nAt height %Ld\nBurned into LTC block: %s\nWith LTC tx: %s\n" (hashval_hexstring dbh) !artificialblockheight (hashval_hexstring lbk) (hashval_hexstring ltx)
+      | None ->
+         Printf.fprintf oc "No best block is currently known.\n");
   ac "ltcgettxinfo" "ltcgettxinfo <txid>" "Get proofgold related information about an ltc burn tx."
     (fun oc al ->
       match al with
@@ -4702,7 +4847,20 @@ let initialize_commands () =
 	      begin
 		try
 		  let (outpj,_) = parse_jsonval outp in
-		  let tau = Commands.createtx inpj outpj in
+		  let ((inpl,outpl) as tau) = Commands.createtx inpj outpj in
+                  begin
+                    if not !Config.liteserver then
+                      begin
+                        List.iter
+                          (fun (alpha,_) ->
+                            ignore (ctree_lookup_addr_assets_lsreq_alr alpha)) (* to ensure we will have enough of the ledger tree so we can validate the tx *)
+                        inpl;
+                        List.iter
+                          (fun (alpha,_) ->
+                            ignore (ctree_lookup_addr_assets_lsreq_alr alpha)) (* to ensure we will have enough of the ledger tree so we can validate the tx *)
+                          outpl;
+                      end
+                  end;
 		  let s = Buffer.create 100 in
 		  seosbf (seo_stx seosb (tau,([],[])) (s,None));
 		  let hs = Hashaux.string_hexstring (Buffer.contents s) in
@@ -5322,12 +5480,12 @@ let initialize_commands () =
                let (_,tm,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
                if termaddr_p delta then
                  begin
-                   let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq delta) in
+                   let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq delta) in
                    if not (hl = HNil) then
                      raise (Failure (Printf.sprintf "There are already assets at %s.\nPlease choose an unused term address for a bounty.\n" (addr_pfgaddrstr delta)))
                  end;
                let f beta =
-                 let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq beta) in
+                 let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq beta) in
                  match
                    hlist_lookup_asset_gen true true true
                      (fun a -> match a with (_,_,Some(gamma2,n2,r2),Currency(_)) when not r2 && n2 = 0L && gamma2 = p2shaddr_payaddr gamma -> true | _ -> false)
