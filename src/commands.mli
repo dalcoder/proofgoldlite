@@ -1,3 +1,4 @@
+(* Copyright (c) 2022 The Proofgold Love developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
 (* Copyright (c) 2015 The Qeditas developers *)
 (* Copyright (c) 2017-2019 The Dalilcoin developers *)
@@ -47,7 +48,14 @@ val printhconselt : out_channel -> hashval -> unit
 val printasset : out_channel -> hashval -> unit
 val printtx : out_channel -> hashval -> unit
 
+val privkey_from_wallet : p2pkhaddr -> Z.t * bool
+val privkey_and_pubkey_from_wallet : p2pkhaddr -> (Z.t * bool) * (Z.t * Z.t)
+
+val ltctopfgaddr : out_channel -> string -> unit
 val btctopfgaddr : out_channel -> string -> unit
+val pfgtoltcaddr : out_channel -> string -> unit
+val pfgtobtcaddr : out_channel -> string -> unit
+val pfgtobtcwif : out_channel -> string -> unit
 val importwallet : out_channel -> string -> unit
 val importprivkey : out_channel -> string -> string -> unit
 val importbtcprivkey : out_channel -> string -> string -> unit
@@ -102,5 +110,8 @@ val collectable_bounties : out_channel -> hashval -> (addr * asset * asset) list
 val createatomicswap : hashval -> md160 -> md160 -> int32 -> p2shaddr * int list
 val createhtlc2 : md160 -> md160 -> int32 -> bool -> hashval -> p2shaddr * int list * hashval
 val createhtlc : md160 -> md160 -> int32 -> bool -> hashval -> p2shaddr * int list * hashval
+val createbtchtlc2 : md160 -> md160 -> int -> bool -> hashval -> p2shaddr * int list * hashval
+val createbtchtlc : md160 -> md160 -> int -> bool -> hashval -> p2shaddr * int list * hashval
 val createmultisig2 : int -> (string * ((Z.t * Z.t) * bool)) list -> p2shaddr * int list
 val createmultisig : int -> jsonval -> p2shaddr * int list
+val extract_secret_from_btctx : hashval -> int -> string -> hashval

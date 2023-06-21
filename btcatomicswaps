@@ -1,0 +1,452 @@
+The Proofgold Core, Lava and Love clients all have support
+for atomic swaps with Litecoin. These swaps can be performed
+automatically by the code, using the fact that Proofgold's
+consensus algorithm relies on Litecoin.
+
+Using hash timelock contracts (HTLC) it is possible to do atomic swaps
+with many other cryptocurrencies.  The primary target of the
+implementation is Bitcoin, but the same techniques would work with
+Bitcoin Cash, Bitcoin Gold and various other cryptocurrencies
+sufficiently similar to Bitcoin.
+
+Unlike the atomic swaps with Litecoin, HTLC atomic swaps require
+manual intervention and alertness. If one party does not perform the
+next step sufficiently quickly, it is up to the other party to
+manually rescue their funds in a given amount of time.
+
+Here is a high-level outline of the procedure.
+
+Suppose Alice has 0.00019 btc and wants to buy 1 pfg (minus tx fees).
+Suppose Bob has 1 pfg and wants 0.00019 btc (minus tx fees).
+Suppose they find each other and agree to make the swap.
+
+Step 1: Bob calls createbtcswap to create two p2sh addresses
+for htlc scripts (one for Proofgold and one for Bitcoin).
+The htlc script for Proofgold is spendable by Alice if she
+knows the secret and by Bob after 72 Proofgold blocks (roughly 3 days).
+The htlc script for Bitcoin is spendable by Bob if he knows
+the secret and by Alice after 127 Bitcoin blocks (roughly 21 hours).
+The secret is generated for Bob by createbtcswap.
+Bob shares with Alice all the information except the secret,
+giving Alice only the hash of the secret.
+
+Step 2: Alice uses the command validatebtcswap to doublecheck
+the information Bob passed to her.
+
+Step 3: Bob sends 1 pfg to the Proofgold p2sh htlc address.
+Alice waits for, say, 3 confirmations (roughly 3 hours).
+
+Step 4: Alice sends 0.00019 btc to the Bitcoin p2sh htlc address.
+Bob waits for, say, 3 confirmations (roughly 30 minutes).
+
+Step 5: Bob uses the command collectbtcswap to create and sign a
+Bitcoin transaction (using the secret) to spend the 0.00019 btc to
+himself. Bob publishes the Bitcoin transaction.
+
+Step 6: Alice sees the Bitcoin transaction and uses the command
+extractsecretfrombtctx (or extractsecretfrombtctxfile) to
+extract the secret from Bob's signature of the transaction.
+
+Step 7: Alice uses the commands createtx and signtx (with the
+secret) to spend the 1 pfg to herself.
+
+The description above assumes both parties are cooperative
+and normal operation of both blockchains. Under those conditions
+a successful swap should take about 4 hours. Next we analyze
+what could go wrong in various steps by answering some questions.
+
+Why does Alice need to call validatebtcswap in Step 2?
+If Bob were dishonest, he could create faulty htlc scripts
+in Step 1 that would allow him to spend both the btc and pfg
+funds. To prevent this, Alice needs to validate the information
+-- including both the btc and pfg scripts. If Alice cannot validate
+the information, she should abandon the swap.
+
+What if Bob never sends the 1 pfg in Step 3? In this case
+neither party has moved any funds and the swap can simply be
+abandoned.
+
+Why should Alice wait for 3 Proofgold confirmations in Step 3?  If
+Alice sends the btc in Step 4 too early, Bob could immediately spend
+the 0.00019 btc to himself (revealing the secret) and potentially
+doublespend the 1 pfg back to himself by orphaning the Proofgold
+blocks with the confirmations. It is up to Alice to decide how many
+confirmations is enough. Alice could wait for a day's worth of
+confirmations to be more confident. Note, however, that after 3 days
+(72 confirmations), Bob will be able to refund the 1 btc to himself,
+so Alice should choose a reasonable number.
+
+What if Alice never sends the btc to the Bitcoin p2sh htlc address
+in Step 4? Bob can wait 3 days (72 Proofgold blocks) and spend
+the 1 pfg (minus tx fees) back to himself. The commands
+createtx and signtx can be used for this.
+
+Why should Bob wait for 3 Bitcoin confirmations in Step 4?
+If Bob collects the btc too quickly (revealing the secret),
+then Alice can collect the pfg with the secret and simultaneously
+attempt to doublespend the btc back to herself. Bob can decide
+the number of confirmations required (and with Bitcoin, 1 is
+usually sufficient) but should keep in mind that after 127 Bitcoin
+blocks (about 21 hours), Alice will be able to spend the btc back
+to herself.
+
+What if Bob does not collect the btc in Step 5? In that case
+Alice will not learn the secret and will not be able to collect
+the pfg. Instead, after 127 Bitcoin blocks (21 hours), Alice
+will be able to reclaim the btc (minus tx fees). Alice can
+use the command refundbtcswap for this purpose.
+
+What if Alice does not notice that Bob has claimed the btc?  After Bob
+spends the btc, it is Alice's responsibility to notice this fact
+perform Steps 6 and 7 before the 72 block time limit (roughly 3 days)
+on the Proofgold htlc. If she does not do so, Bob will be able to
+collect the pfg ending up with both the btc and pfg.
+
+Detailed examples are given below.
+
+Preliminary setup (keys and addresses):
+
+Each of Alice and Bob need a private key that control
+a Bitcoin and a Proofgold p2pkh address. They can either
+obtain this by using a Bitcoin wallet or a Proofgold wallet.
+Note that the Bitcoin address is a *legacy* p2pkh address
+and not segwit bech32 address. Likewise Bitcoin p2sh addresses
+will be legacy p2sh addresses and not segwit p2sh addresses.
+
+Suppose Alice is running Bitcoin core and wants
+to generate a key and address. She can do this in Bitcoin Core's
+console:
+
+> getnewaddress "swaptest3" "legacy"
+16tM2GsKceJVqC838miTqgtGBATg9iyKAt
+
+Alice is likely to need the private key and she
+can obtain it from Bitcoin Core's console as follows:
+
+> dumpprivkey 16tM2GsKceJVqC838miTqgtGBATg9iyKAt
+Kaliceprivatekey
+
+She can then find the corresponding Proofgold address in Proofgold
+as follows:
+
+> btctopfgaddr 16tM2GsKceJVqC838miTqgtGBATg9iyKAt
+Proofgold address Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd corresponds to Bitcoin address 16tM2GsKceJVqC838miTqgtGBATg9iyKAt
+
+So Alice's addresses are
+Alice's Bitcoin address: 16tM2GsKceJVqC838miTqgtGBATg9iyKAt
+Alice's Proofgold address: Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd
+
+Bob uses Proofgold to generate the key and address:
+
+> newaddress
+PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh
+
+> pfgtobtcaddr PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh
+Proofgold address PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh corresponds to Bitcoin address 1M4YUP8f9Mejg6GCCfgfE1ehFpBtCFfvR7
+
+Bob's Bitcoin address: 1M4YUP8f9Mejg6GCCfgfE1ehFpBtCFfvR7
+Bob's Proofgold address: PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh
+
+We will use these addresses for Alice and Bob in the examples.
+
+* Example 1: A successful swap.
+
+Suppose Alice and Bob want to swap 0.00019 btc for 1 pfg
+as described above. Assume both Alice and Bob know each
+other's addresses before starting.
+
+Step 1: Bob calls createbtcswap.
+The template for the call is as follows:
+
+createbtcswap <p2pkhaddr:alpha> <p2pkhaddr:beta> [<secret>]
+
+Bob can optionally give the secret (64 hex chars = 256 bits)
+but by default Proofgold Love generates a secret.
+The "alpha" address is Alice's Proofgold address
+and the "beta" address is Bob's Proofgold address.
+For this specific case, Bob calls it as follows:
+
+> createbtcswap Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh
+
+Pfg script: 6382012088a820f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c91298876a914408e8e741c71119ccf7a1b51042068e272d1b1e4670448000000b27576a914dc0e08ff30d7d90834389bee7664500dee36e5ae6888ac
+Pfg p2sh: PsZ1vE8EpsgTMoFCXaMCSXgTmPVUj7tiBQP
+Btc script: 6382012088a820f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c91298876a914dc0e08ff30d7d90834389bee7664500dee36e5ae67017fb27576a914408e8e741c71119ccf7a1b51042068e272d1b1e46888ac
+Btc p2sh: 3NjyBHecRnb4wbcpnkqwPo23DU3scVQii1
+Secret: 94ac6788bfc3c79ad7c59a089fa2e97b51f502a1f287a870813d503056d76174
+Hash of secret: f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c9129
+
+Bob can send all of this information *except the secret* to Alice.
+Bob must send Alice at least the p2sh addresses and the hash of the
+secret:
+
+Pfg p2sh: PsZ1vE8EpsgTMoFCXaMCSXgTmPVUj7tiBQP
+Btc p2sh: 3NjyBHecRnb4wbcpnkqwPo23DU3scVQii1
+Hash of secret: f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c9129
+
+Step 2: Alice calls validatebtcswap.
+
+validatebtcswap <p2pkhaddr:alpha> <p2pkhaddr:beta> <hashofsecret> <pfgp2shaddr> <btcp2shaddr>
+
+In this case:
+
+> validatebtcswap Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c9129 PsZ1vE8EpsgTMoFCXaMCSXgTmPVUj7tiBQP 3NjyBHecRnb4wbcpnkqwPo23DU3scVQii1
+Swap contract addresses validated. Everything looks correct.
+
+If Alice sees anything other than this response, she must
+abandon the swap.
+
+Step 3: Bob sends 1 pfg to the p2sh address PsZ1vE8EpsgTMoFCXaMCSXgTmPVUj7tiBQP.
+
+> sendtoaddress PsZ1vE8EpsgTMoFCXaMCSXgTmPVUj7tiBQP 1
+f6f98a69eed4a542c75580a9eca49982ae2f3073b297e266ea505c9b1674bec8
+
+Alice watches this address and waits for enough confirmations.
+An easy way to do this is to import the p2sh address as a watch
+address:
+
+> importwatchaddr PsZ1vE8EpsgTMoFCXaMCSXgTmPVUj7tiBQP
+
+and then use printassets to see when the 1 pfg arrives.
+The asset will show the block height at which it is confirmed
+(the asset's "birthday") in [], e.g., [21118]. To wait for
+3 confirmations, call "bestblock" until a height of at least
+3 more is reported (in this case, 21121).
+
+Step 4: Alice sends the 0.00019 btc to the p2sh address
+3NjyBHecRnb4wbcpnkqwPo23DU3scVQii1. This can be done
+in a Bitcoin client in various ways. In this case the
+tx is 5273d1df8e069c7ed7baaeb804f461f6a38872ffd8da9bd08e08300d479c7089.
+
+Bob watches this (e.g., in a block explorer) and waits for it to
+have 3 confirmations.
+
+Step 5: Bob collects the btc, using 1000 satoshis as a tx fee,
+via the Proofgold command collectbtcswap.
+
+The template for the command is as follows:
+
+collectbtcswap <p2pkhaddr:alpha> <p2pkhaddr:beta> <secret> <btctxid> <vout> <btcamount>
+
+Again, the first two addresses are Alice's and Bob's.
+The third argument is the secret, which only Bob knows.
+The fourth and fifth arguments are the bitcoin txid from
+Step 4 and the vout (which output has the p2sh output).
+The last amount is the btc amount (after removing the tx fee).
+
+In this case the secret is
+94ac6788bfc3c79ad7c59a089fa2e97b51f502a1f287a870813d503056d76174.
+The bitcoin txid id is
+5273d1df8e069c7ed7baaeb804f461f6a38872ffd8da9bd08e08300d479c7089
+and the output number (vout value) is 0.  After removing the 1000
+satoshis for a tx fee, the amount of bitcoin to collect is 0.00018.
+This command assumes Bob's private key for his address
+PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh is in his Proofgold wallet.
+It is needed to sign the bitcoin transaction.
+
+> collectbtcswap Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh 94ac6788bfc3c79ad7c59a089fa2e97b51f502a1f287a870813d503056d76174 fd806bcd76266628d38800054d577021926c03e00f7dc7bafab47c994aed9bb9 0 0.00018
+
+This returns the following signed bitcoin transaction:
+
+0200000001b99bed4a997cb4fabac77d0fe0036c922170574d050088d328662676cd6b80fd00000000ed4830450221009ef5665422b049a448a132be3ebbf90549628d99cd3455cd80f76249a9d385d402202bf702a4a5a6d839d881cea22abe2f6743d55b6556790d7c7731ed0fe80092470121038fe53c85ce00d7e4f3ff9ec3140021be2301f517f1d670bf7dab281f407782122094ac6788bfc3c79ad7c59a089fa2e97b51f502a1f287a870813d503056d76174514c5e6382012088a820f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c91298876a914dc0e08ff30d7d90834389bee7664500dee36e5ae67017fb27576a914408e8e741c71119ccf7a1b51042068e272d1b1e46888acffffffff0150460000000000001976a914dc0e08ff30d7d90834389bee7664500dee36e5ae88ac00000000
+
+This can be sent by various Bitcoin clients (e.g.,
+Bitcoin Core using sendrawtransaction) or broadcast
+via various Bitcoin block explorers (e.g., blockchair.com/broadcast).
+The txid is
+
+5dfb3c803a00697da2894ce04297ee01171ca01221aae811e4d7db7f81022c3f
+
+To be safe, Bob should include a sufficient tx fee
+that the Bitcoin tx will confirm quickly (since otherwise
+there is a risk that the 127 block window will pass and Alice
+will be able to take back the bitcoins). If the fee is too low,
+Bob can use collectbtcswap again with a higher fee
+(i.e., reducing the number of bitcoins collected) and
+broadcast the new alternative.
+
+Step 6: As soon as Alice sees the transaction above, she
+can give the hex of the full tx to the command extractsecretfrombtctx
+to obtain the secret.
+
+The template for the command is
+
+extractsecretfrombtctx <txid> <vout> <btctxhex>
+
+The <txid> and <vout> are the same as <txid> and <vout>
+from Bob's use of collectbtcswap, i.e.,
+fd806bcd76266628d38800054d577021926c03e00f7dc7bafab47c994aed9bb9 0.
+This identifies the btc utxo Bob has just spent in the tx.
+
+In this case Alice calls the following in Proofgold:
+
+> extractsecretfrombtctx fd806bcd76266628d38800054d577021926c03e00f7dc7bafab47c994aed9bb9 0 0200000001b99bed4a997cb4fabac77d0fe0036c922170574d050088d328662676cd6b80fd00000000ed4830450221009ef5665422b049a448a132be3ebbf90549628d99cd3455cd80f76249a9d385d402202bf702a4a5a6d839d881cea22abe2f6743d55b6556790d7c7731ed0fe80092470121038fe53c85ce00d7e4f3ff9ec3140021be2301f517f1d670bf7dab281f407782122094ac6788bfc3c79ad7c59a089fa2e97b51f502a1f287a870813d503056d76174514c5e6382012088a820f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c91298876a914dc0e08ff30d7d90834389bee7664500dee36e5ae67017fb27576a914408e8e741c71119ccf7a1b51042068e272d1b1e46888acffffffff0150460000000000001976a914dc0e08ff30d7d90834389bee7664500dee36e5ae88ac00000000
+
+Secret: 94ac6788bfc3c79ad7c59a089fa2e97b51f502a1f287a870813d503056d76174
+
+If the btc tx is large, the command extractsecretfrombtctxfile
+can be used instead.
+
+Step 7: Alice spends the 1 pfg (minus tx fees) to herself.
+She first uses createtx to create the tx:
+
+> createtx '[{"PsZ1vE8EpsgTMoFCXaMCSXgTmPVUj7tiBQP":"228bd4a07b4f0aac300887c1c0649b980ff86042e24111015aedd641504069f8"}]' '[{"addr":"Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd","val":0.9999}]'
+
+2bd6e419391dd706603b4c5fee84750f6ec7ff9c1559a406dd7b52608541380c0626dbc47cc00713120f8a08d06ab70e82024ac3172047473a8eb808ce67bd8d2802103471b9e85872000000b838f28e0204
+
+She now needs to sign the tx. This requires knowing her private key
+("Kaliceprivatekey" above), the redeem script and the secret.
+Bob may have sent Alice the redeem script in Step 1, but
+Alice can also obtain it now that she has the secret as follows:
+
+> createbtcswap Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh 94ac6788bfc3c79ad7c59a089fa2e97b51f502a1f287a870813d503056d76174
+
+Pfg script: 6382012088a820f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c91298876a914408e8e741c71119ccf7a1b51042068e272d1b1e4670448000000b27576a914dc0e08ff30d7d90834389bee7664500dee36e5ae6888ac
+...
+
+> signtx 2bd6e419391dd706603b4c5fee84750f6ec7ff9c1559a406dd7b52608541380c0626dbc47cc00713120f8a08d06ab70e82024ac3172047473a8eb808ce67bd8d2802103471b9e85872000000b838f28e0204 '["Kaliceprivatekey"]' '["6382012088a820f244cd6f1bd86b37615b52a0ffb379bc35b16338624d65cf5cacbd56d71c91298876a914408e8e741c71119ccf7a1b51042068e272d1b1e4670448000000b27576a914dc0e08ff30d7d90834389bee7664500dee36e5ae6888ac"]' '["94ac6788bfc3c79ad7c59a089fa2e97b51f502a1f287a870813d503056d76174"]'
+
+2bd6e419391dd706603b4c5fee84750f6ec7ff9c1559a406dd7b52608541380c0626dbc47cc00713120f8a08d06ab70e82024ac3172047473a8eb808ce67bd8d2802103471b9e85872000000b838f28e02b4060538bd35cde425838ec47f183048e469b1fa169cdb7e6c9ba9cf92067ed3355de554bd424f3c1626c0cd5dc9aeb4ab36a9d3981e1fcfb7ecda7371b43e81026dd8953c47e4b9d54e561952a06aeee37fa2444cb6f266fff717efacb910e96290d5432a3dbf7a20d2be4a07670e4bd02348caaccf22fe3dfcb8e6ebc53523fc2c3afddea8f50586967f1835dcc03da1c2b47a3d2cdda84cc38e151c102462d420e5136dfe7623f6b537c36e950afaffecbcbc6bc61e8b536cd3b2cfb9b2ee6df53ac7c82911db4d4d11a863c77439c68dc8f9b9de8d510982442b5e6ef4d8e4cf12440a102040d975eda6a6c8dd21c2ff30af67474813e766f776c9426de8de6679d76811b302
+Completely signed.
+
+She can optionally doublecheck the tx with validatetx:
+
+> validatetx 2bd6e419391dd706603b4c5fee84750f6ec7ff9c1559a406dd7b52608541380c0626dbc47cc00713120f8a08d06ab70e82024ac3172047473a8eb808ce67bd8d2802103471b9e85872000000b838f28e02b4060538bd35cde425838ec47f183048e469b1fa169cdb7e6c9ba9cf92067ed3355de554bd424f3c1626c0cd5dc9aeb4ab36a9d3981e1fcfb7ecda7371b43e81026dd8953c47e4b9d54e561952a06aeee37fa2444cb6f266fff717efacb910e96290d5432a3dbf7a20d2be4a07670e4bd02348caaccf22fe3dfcb8e6ebc53523fc2c3afddea8f50586967f1835dcc03da1c2b47a3d2cdda84cc38e151c102462d420e5136dfe7623f6b537c36e950afaffecbcbc6bc61e8b536cd3b2cfb9b2ee6df53ac7c82911db4d4d11a863c77439c68dc8f9b9de8d510982442b5e6ef4d8e4cf12440a102040d975eda6a6c8dd21c2ff30af67474813e766f776c9426de8de6679d76811b302
+
+Tx is valid and has id 8346e5381ed39342db54e2f454ff7d16c2e4cc3935449736930b6035252fb037
+Tx is supported by the current ledger and has fee 0.0001 bars (above minrelayfee 0.0000345 bars)
+
+She can then send the tx with sendtx:
+
+> sendtx 2bd6e419391dd706603b4c5fee84750f6ec7ff9c1559a406dd7b52608541380c0626dbc47cc00713120f8a08d06ab70e82024ac3172047473a8eb808ce67bd8d2802103471b9e85872000000b838f28e02b4060538bd35cde425838ec47f183048e469b1fa169cdb7e6c9ba9cf92067ed3355de554bd424f3c1626c0cd5dc9aeb4ab36a9d3981e1fcfb7ecda7371b43e81026dd8953c47e4b9d54e561952a06aeee37fa2444cb6f266fff717efacb910e96290d5432a3dbf7a20d2be4a07670e4bd02348caaccf22fe3dfcb8e6ebc53523fc2c3afddea8f50586967f1835dcc03da1c2b47a3d2cdda84cc38e151c102462d420e5136dfe7623f6b537c36e950afaffecbcbc6bc61e8b536cd3b2cfb9b2ee6df53ac7c82911db4d4d11a863c77439c68dc8f9b9de8d510982442b5e6ef4d8e4cf12440a102040d975eda6a6c8dd21c2ff30af67474813e766f776c9426de8de6679d76811b302
+
+8346e5381ed39342db54e2f454ff7d16c2e4cc3935449736930b6035252fb037
+
+Once the Bob's Bitcoin tx and Alice's Proofgold tx confirm,
+the swap is complete.
+
+* Example 2: An unsuccessful swap
+
+Suppose Alice wants to swap 0.00019 btc with Bob for 1 pfg.
+
+Step 1: Bob initiates the swap as in Example 1.
+The secret changes, leading to different p2sh scripts and addresses.
+
+> createbtcswap Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh
+
+Pfg script: 6382012088a8207672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d98876a914408e8e741c71119ccf7a1b51042068e272d1b1e4670448000000b27576a914dc0e08ff30d7d90834389bee7664500dee36e5ae6888ac
+Pfg p2sh: PsbEUyPNqkmwtgTGfrEN92872Q2aCxpUrcF
+Btc script: 6382012088a8207672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d98876a914dc0e08ff30d7d90834389bee7664500dee36e5ae67017fb27576a914408e8e741c71119ccf7a1b51042068e272d1b1e46888ac
+Btc p2sh: 3Pc99rs1CfsZzWMQvrefw5hiukpByG7w6i
+Secret: 37e291677176278d1f1287a4ddd67b264172ddedf8360b0327621321a793cfa2
+Hash of secret: 7672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d9
+
+Bob sends the important information to Alice:
+
+Pfg p2sh: PsbEUyPNqkmwtgTGfrEN92872Q2aCxpUrcF
+Btc p2sh: 3Pc99rs1CfsZzWMQvrefw5hiukpByG7w6i
+Hash of secret: 7672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d9
+
+Step 2: Alice validates the information.
+
+> validatebtcswap Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh 7672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d9 PsbEUyPNqkmwtgTGfrEN92872Q2aCxpUrcF 3Pc99rs1CfsZzWMQvrefw5hiukpByG7w6i
+
+Swap contract addresses validated. Everything looks correct.
+
+Step 3: Bob sends 1 pfg to the p2sh address PsbEUyPNqkmwtgTGfrEN92872Q2aCxpUrcF.
+
+> sendtoaddress PsbEUyPNqkmwtgTGfrEN92872Q2aCxpUrcF 1
+3f610a977e969ec1b33c35ecb10e56a8a5ed2053ba82924bca4c027052b05eda
+
+Alice waits for a few confirmations.
+
+Step 4: Alice sends the 0.00019 btc to the p2sh address
+3Pc99rs1CfsZzWMQvrefw5hiukpByG7w6i.
+
+The bitcoin tx is
+fd806bcd76266628d38800054d577021926c03e00f7dc7bafab47c994aed9bb9
+with vout=1 for the p2sh address 3Pc99rs1CfsZzWMQvrefw5hiukpByG7w6i.
+
+At this point assume Bob neglects to collect the 0.00019 btc.
+
+Alice waits 22 hours, after which the
+tx fd806bcd76266628d38800054d577021926c03e00f7dc7bafab47c994aed9bb9
+should have over 127 confirmations. By that point if Bob
+*has* collected the btc, then Alice can complete the swap
+as in the previous example (using the secret to collect the 1 pfg).
+Assume Bob has *not* collected the btc. Alice can use
+the command refundbtcswap to take back the 0.00018.
+
+The template for refundbtcswap is
+
+refundbtcswap <p2pkhaddr:alpha> <p2pkhaddr:beta> <hashofsecret> <btctxid> <vout> <btcamount>
+
+This is similar to collectbtcswap except it only needs the hash
+of the secret (which Alice has). The command also assumes
+Alice's private key ("Kaliceprivatekey") is in the Proofgold wallet.
+(Alice can use the commands importprivkey or importbtcprivkey to
+assure this.)
+
+> refundbtcswap Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh 7672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d9 fd806bcd76266628d38800054d577021926c03e00f7dc7bafab47c994aed9bb9 1 0.00018
+
+This produces the following btc transaction:
+
+0200000001b99bed4a997cb4fabac77d0fe0036c922170574d050088d328662676cd6b80fd01000000cc483045022100d3e9808a0f518f4407a7cce21bf1145d74c60d78f6ed04e0068b2740e8670c9102201aed8caf3a4a84769fa5018c415cc2def7b68553f05a157c99df5a554c31b2e4012102aadce33f288864959bfef78b3b350b488b20d5214ae7ab03487d4a839961041e004c5e6382012088a8207672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d98876a914dc0e08ff30d7d90834389bee7664500dee36e5ae67017fb27576a914408e8e741c71119ccf7a1b51042068e272d1b1e46888ac7f0000000150460000000000001976a914408e8e741c71119ccf7a1b51042068e272d1b1e488ac00000000
+
+with txid
+5e2d9292c073b5c47cfbafc04e48025ddbb1d1fd8ff14b6e1164a94b422f110c.
+
+The bitcoin tx sends 0.00018 to Alice's bitcoin address
+16tM2GsKceJVqC838miTqgtGBATg9iyKAt.
+
+Alice can broadcast this transaction and wait for it to confirm.
+She can also increase the tx fee by calling the command
+again and broadcasting the new tx.
+
+> refundbtcswap Pr8sdQrR3fiDiuWFJjJYxgaBukHswGtibvd PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh 7672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d9 fd806bcd76266628d38800054d577021926c03e00f7dc7bafab47c994aed9bb9 1 0.000175
+
+This creates a new bitcoin tx
+
+0200000001b99bed4a997cb4fabac77d0fe0036c922170574d050088d328662676cd6b80fd01000000cc483045022100ae20c9da67e83c60938815d9fc07dce8356707c76270013716841eda694d2f060220113bebc6ce3d0640badf86e0ced04b570dbe297f185e30bca4d001e3681afa98012102aadce33f288864959bfef78b3b350b488b20d5214ae7ab03487d4a839961041e004c5e6382012088a8207672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d98876a914dc0e08ff30d7d90834389bee7664500dee36e5ae67017fb27576a914408e8e741c71119ccf7a1b51042068e272d1b1e46888ac7f000000015c440000000000001976a914408e8e741c71119ccf7a1b51042068e272d1b1e488ac00000000
+
+with txid
+86938ca9b4f71fbeaef87b479c93f37ccc18bfaa204ed538d0c9cc72025cede1
+
+which sends 0.000175 to Alice's bitcoin address
+16tM2GsKceJVqC838miTqgtGBATg9iyKAt.
+
+This is the tx that confirmed in the bitcoin blockchain.
+After confirmation, Alice has recovered her bitcoin.
+
+After 2 more days (72 Proofgold blocks), Bob should spend
+the 1 pfg at PsbEUyPNqkmwtgTGfrEN92872Q2aCxpUrcF back to himself.
+This is less time sensitive since as long as Bob does not
+reveal the secret, only he will be able to spend the pfg at
+PsbEUyPNqkmwtgTGfrEN92872Q2aCxpUrcF.
+
+> createtx '[{"PsbEUyPNqkmwtgTGfrEN92872Q2aCxpUrcF":"52bf3123436c2a7f497d579526e638830325fbda08b7a5e00b8cdcfe9c28a76a"}]' '[{"addr":"PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh","val":0.9999}]'
+
+eb5687d6c8a7ed4e8f99dca5a5e43da61f53befe97fa8d19196253f94beabbaa3431c7191c28d9d746b82d055f60e4f6e7443955136e07847f98eb6c041a9c4d773b32a806779b7257000000b838f28e0204
+
+To sign the tx, signtx is used with Bob's private key
+and the redeem script.
+
+> dumpprivkey PrP3prxgPCRZxkQPToCXA4txLpwc9P3FaQh
+Private key: kbobprivkey
+
+> signtx eb5687d6c8a7ed4e8f99dca5a5e43da61f53befe97fa8d19196253f94beabbaa3431c7191c28d9d746b82d055f60e4f6e7443955136e07847f98eb6c041a9c4d773b32a806779b7257000000b838f28e0204 '["kbobprivkey"]' '["6382012088a8207672fd295c94b44e4f0ebdf51e9cc7a5bc82205a9e16510d37f2bdc74a27a8d98876a914408e8e741c71119ccf7a1b51042068e272d1b1e4670448000000b27576a914dc0e08ff30d7d90834389bee7664500dee36e5ae6888ac"]'
+
+eb5687d6c8a7ed4e8f99dca5a5e43da61f53befe97fa8d19196253f94beabbaa3431c7191c28d9d746b82d055f60e4f6e7443955136e07847f98eb6c041a9c4d773b32a806779b7257000000b838f28e02b4060588b42b6ba6ab813fcee955ad6b824249df379d952345b9854157040ffebe54bc5645464d4bb9fff4d3851f6fa72bbc3e47f27ea11edf8cf9f97a8490cbbb1fbd17bd48a025a5e3e61f72e0e3f23c0b3b07789dfcfcff9e87530418d2f7c880f52fc6b70ef777dfd5283f02bd2b582240a661c70a0e0812316a9076e5f64fc995326da74f1df6aeef91f3f1d2bc0583d4ead962d48637e5f73eaef424eaec88eda6a608d4b163ba1ce346e4fc5cefc6a80441a2152f377a6cf2670922050810a0ecba765353e4ee10e17f98d7b323a48973b37bbb64a136746fb3bc6bb4885901
+Completely signed.
+
+Bob can optionally doublecheck the tx.
+
+> validatetx eb5687d6c8a7ed4e8f99dca5a5e43da61f53befe97fa8d19196253f94beabbaa3431c7191c28d9d746b82d055f60e4f6e7443955136e07847f98eb6c041a9c4d773b32a806779b7257000000b838f28e02b4060588b42b6ba6ab813fcee955ad6b824249df379d952345b9854157040ffebe54bc5645464d4bb9fff4d3851f6fa72bbc3e47f27ea11edf8cf9f97a8490cbbb1fbd17bd48a025a5e3e61f72e0e3f23c0b3b07789dfcfcff9e87530418d2f7c880f52fc6b70ef777dfd5283f02bd2b582240a661c70a0e0812316a9076e5f64fc995326da74f1df6aeef91f3f1d2bc0583d4ead962d48637e5f73eaef424eaec88eda6a608d4b163ba1ce346e4fc5cefc6a80441a2152f377a6cf2670922050810a0ecba765353e4ee10e17f98d7b323a48973b37bbb64a136746fb3bc6bb4885901
+
+Tx is valid and has id 95d76571d3a5525dafd274e74e2759494fd50f01357caafe06088223837a080d
+Tx is supported by the current ledger and has fee 0.0001 bars (above minrelayfee 0.0000308 bars)
+
+> sendtx eb5687d6c8a7ed4e8f99dca5a5e43da61f53befe97fa8d19196253f94beabbaa3431c7191c28d9d746b82d055f60e4f6e7443955136e07847f98eb6c041a9c4d773b32a806779b7257000000b838f28e02b4060588b42b6ba6ab813fcee955ad6b824249df379d952345b9854157040ffebe54bc5645464d4bb9fff4d3851f6fa72bbc3e47f27ea11edf8cf9f97a8490cbbb1fbd17bd48a025a5e3e61f72e0e3f23c0b3b07789dfcfcff9e87530418d2f7c880f52fc6b70ef777dfd5283f02bd2b582240a661c70a0e0812316a9076e5f64fc995326da74f1df6aeef91f3f1d2bc0583d4ead962d48637e5f73eaef424eaec88eda6a608d4b163ba1ce346e4fc5cefc6a80441a2152f377a6cf2670922050810a0ecba765353e4ee10e17f98d7b323a48973b37bbb64a136746fb3bc6bb4885901
+
+95d76571d3a5525dafd274e74e2759494fd50f01357caafe06088223837a080d
+
+After this confirms, Bob has recovered his pfg.

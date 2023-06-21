@@ -115,6 +115,7 @@ val ltc_cancelswapbuyoffer : string -> unit
 val ltc_createswapoffertx : addr -> int64 -> int64 -> string
 val ltc_unspent : string -> int -> bool
 
+val blnum32 : int32 -> int list
 val blnum64 : int64 -> int list
 
 val broadcast_alert_via_ltc : char -> string -> string

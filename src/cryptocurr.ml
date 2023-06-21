@@ -115,6 +115,21 @@ let pfgwif k compr =
   let (sh20,_,_,_,_,_,_,_) = sha256dstr (Buffer.contents s) in
   base58 (or_big_int (shift_left_big_int (or_big_int k (shift_left_big_int (big_int_of_int pre) 256)) 32) (int32_big_int_bits sh20 0))
 
+let btcwif k compr =
+  let pre = if !Config.testnet then 0xef else 0x80 in
+  let k1 = 
+    if compr then
+      or_big_int unit_big_int (shift_left_big_int (or_big_int (shift_left_big_int (big_int_of_int pre) 256) k) 8)
+    else
+      or_big_int (shift_left_big_int (big_int_of_int pre) 256) k
+  in
+  let s = Buffer.create 34 in
+  Buffer.add_char s (Char.chr pre);
+  ignore (seo_hashval seosb (big_int_hashval k) (s,None));
+  if compr then Buffer.add_char s (Char.chr 1);
+  let (sh20,_,_,_,_,_,_,_) = sha256dstr (Buffer.contents s) in
+  base58 (or_big_int (shift_left_big_int k1 32) (int32_big_int_bits sh20 0))
+
 let ltcwif k compr =
   let pre = if !Config.testnet then 0xef else 0xb0 in
   let k1 = 
@@ -283,6 +298,16 @@ let btcaddrstr_addr b =
   else
     raise (Failure "Not a Bitcoin address")
 
+let ltcaddrstr_addr b =
+  let (_,p,x0,x1,x2,x3,x4,cksm) = big_int_md256 (frombase58 b) in
+  if not (cksm = calc_checksum (Int32.to_int p) (x0,x1,x2,x3,x4)) then raise (Failure "Not a valid Litecoin address (checksum incorrect)");
+  if p = 48l then
+    (0,x0,x1,x2,x3,x4)
+  else if p = 50l then
+    (1,x0,x1,x2,x3,x4)
+  else
+    raise (Failure "Not a Litecoin address")
+
 let md160_btcaddrstr rm1 =
   let c0 = count0bytes rm1 in
   let s = Buffer.create 21 in
@@ -293,6 +318,25 @@ let md160_btcaddrstr rm1 =
   let (rm10,rm11,rm12,rm13,rm14) = rm1 in
   let a = md256_big_int (0l,0l,rm10,rm11,rm12,rm13,rm14,sh30) in
   ((String.make (c0+1) '1') ^ (base58 a))
+
+let payaddr_btcaddrstr (b,rm10,rm11,rm12,rm13,rm14) =
+  if b then
+    let s = Buffer.create 21 in
+    Buffer.add_char s '\005';
+    ignore (seo_md160 seosb (rm10,rm11,rm12,rm13,rm14) (s,None));
+    let (sh30,_,_,_,_,_,_,_) = sha256dstr (Buffer.contents s) in
+    let a = md256_big_int (0l,5l,rm10,rm11,rm12,rm13,rm14,sh30) in
+    base58 a
+  else
+    md160_btcaddrstr (rm10,rm11,rm12,rm13,rm14)
+
+let payaddr_ltcaddrstr (b,rm10,rm11,rm12,rm13,rm14) =
+  let s = Buffer.create 21 in
+  Buffer.add_char s (if b then '\050' else '\048');
+  ignore (seo_md160 seosb (rm10,rm11,rm12,rm13,rm14) (s,None));
+  let (sh30,_,_,_,_,_,_,_) = sha256dstr (Buffer.contents s) in
+  let a = md256_big_int (0l,(if b then 50l else 48l),rm10,rm11,rm12,rm13,rm14,sh30) in
+  base58 a
 
 let hashval_gen_addrstr pre rm1 =
   let sh30 = calc_checksum pre rm1 in

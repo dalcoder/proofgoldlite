@@ -1,3 +1,4 @@
+(* Copyright (c) 2022 The Proofgold Love developers *)
 (* Copyright (c) 2022 The Proofgold Lite developers *)
 (* Copyright (c) 2020-2021 The Proofgold Core developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
@@ -519,6 +520,38 @@ let privkey_in_wallet_p alpha =
   else
     false
 
+let privkey_from_wallet xs =
+  let s kl =
+    let (k,c,_,_,_,_) = List.find (fun (_,_,_,_,h,_) -> h = xs) kl in
+    (k,c)
+  in
+  try
+    s !walletkeys_staking
+  with Not_found ->
+    try
+      s !walletkeys_nonstaking
+    with Not_found ->
+      try
+        s !walletkeys_staking_fresh
+      with Not_found ->
+        s !walletkeys_nonstaking_fresh
+
+let privkey_and_pubkey_from_wallet xs =
+  let s kl =
+    let (k,c,pubkey,_,_,_) = List.find (fun (_,_,_,_,h,_) -> h = xs) kl in
+    ((k,c),pubkey)
+  in
+  try
+    s !walletkeys_staking
+  with Not_found ->
+    try
+      s !walletkeys_nonstaking
+    with Not_found ->
+      try
+        s !walletkeys_staking_fresh
+      with Not_found ->
+        s !walletkeys_nonstaking_fresh
+
 let endorsement_in_wallet_p alpha =
   let (p,x4,x3,x2,x1,x0) = alpha in
   if p = 0 || p = 1 then
@@ -589,10 +622,33 @@ let bytelist_of_hexstring h =
   done;
   !bl
 
+let ltctopfgaddr oc a =
+  let alpha = ltcaddrstr_addr a in
+  let a2 = addr_pfgaddrstr alpha in
+  Printf.fprintf oc "Proofgold address %s corresponds to Litecoin address %s\n" a2 a
+
 let btctopfgaddr oc a =
   let alpha = btcaddrstr_addr a in
   let a2 = addr_pfgaddrstr alpha in
   Printf.fprintf oc "Proofgold address %s corresponds to Bitcoin address %s\n" a2 a
+
+let pfgtobtcaddr oc a =
+  let alpha = pfgaddrstr_addr a in
+  let (i,x0,x1,x2,x3,x4) = alpha in
+  if i > 1 then raise (Failure (Printf.sprintf "%s is not a pay address." a));
+  let a2 = payaddr_btcaddrstr (i=1,x0,x1,x2,x3,x4) in
+  Printf.fprintf oc "Proofgold address %s corresponds to Bitcoin address %s\n" a a2
+
+let pfgtobtcwif oc w =
+  let (k,b) = privkey_from_wif w in
+  Printf.fprintf oc "%s\n" (btcwif k b)
+
+let pfgtoltcaddr oc a =
+  let alpha = pfgaddrstr_addr a in
+  let (i,h0,h1,h2,h3,h4) = alpha in
+  if i > 1 then raise (Failure (Printf.sprintf "%s is not a pay address." a));
+  let a2 = payaddr_ltcaddrstr (i=1,h0,h1,h2,h3,h4) in
+  Printf.fprintf oc "Proofgold address %s corresponds to Bitcoin address %s\n" a a2
 
 let importprivkey_real oc (k,b) cls report =
   match Secp256k1.smulp k Secp256k1._g with
@@ -2522,7 +2578,7 @@ let validatetx3 oc blkh tm thtr sgtr ltr txbytes stau transform =
 	    verbose_supportedcheck := Some(oc);
 	    let nfee = ctree_supports_tx (ref 0) true true false thtr sgtr blkh tau ltr in
 	    verbose_supportedcheck := None;
-	    let minfee = Int64.mul (Int64.of_int txbytes) !Config.minrelayfee in
+	    let minfee = Int64.mul (max 20000L (Int64.of_int txbytes)) !Config.minrelayfee in
 	    let fee = Int64.sub 0L nfee in
 	    if fee < 0L then
               Printf.fprintf oc "Tx is supported by the current ledger and but requires %s bars more input.\n" (Cryptocurr.bars_of_atoms (Int64.neg fee))
@@ -2636,7 +2692,7 @@ let sendtx2 oc blkh tm tr sr lr txbytes stau =
 	  let stxh = hashstx stau in
 	  begin
 	    try
-	      let minfee = Int64.mul (Int64.of_int txbytes) !Config.minrelayfee in
+	      let minfee = Int64.mul (max 20000L (Int64.of_int txbytes)) !Config.minrelayfee in
 	      let nfee = ctree_supports_tx (ref 0) true true false (lookup_thytree tr) (lookup_sigtree sr) blkh tau (CHash(lr)) in
 	      let fee = Int64.sub 0L nfee in
 	      if fee >= minfee then
@@ -3988,3 +4044,73 @@ let createmultisig m jpks =
       let pubkeys = List.map (fun j -> match j with JsonStr(s) -> (s,hexstring_pubkey s) | _ -> raise (Failure "expected an array of pubkeys")) jpkl in
       createmultisig2 m pubkeys
   | _ -> raise (Failure "expected an array of pubkeys")
+
+let createbtchtlc2 alpha beta tmlock rel secrh =
+  let scrl =
+    [0x63; (** OP_IF **)
+     0x82; (** OP_SIZE **)
+     0x01;0x20; (** PUSH 0x20 (32) **)
+     0x88; (** OP_EQUALVERIFY to make sure the secret is 32 bytes **)
+     0xa8; (** OP_SHA256 **)
+     0x20] (** PUSH 32 bytes (the hash of the secret) onto the stack **)
+    @ md256_bytelist secrh
+    @ [0x88; (** OP_EQUALVERIFY to ensure the secret hashes to the expected hash **)
+       0x76; (** OP_DUP -- duplicate the given pubkey for alpha **)
+       0xa9; (** OP_HASH160 -- hash the given pubkey **)
+       0x14] (** PUSH 20 bytes (should be hash of pubkey for alpha) onto the stack **)
+    @ md160_bytelist alpha
+    @ [0x67; (** OP_ELSE **)
+       0x01] (** PUSH 1 byte onto the stack (lock time) **)
+    @ [tmlock]
+    @ [if rel then 0xb2 else 0xb1] (** CSV or CLTV to check if this branch is valid yet **)
+    @ [0x75; (** OP_DROP, drop the locktime from the stack **)
+       0x76; (** OP_DUP -- duplicate the given pubkey for beta **)
+       0xa9; (** OP_HASH160 -- hash the given pubkey **)
+       0x14] (** PUSH 20 bytes (should be hash of pubkey for beta) onto the stack **)
+    @ md160_bytelist beta
+    @ [0x68; (** OP_ENDIF **)
+       0x88; (** OP_EQUALVERIFY -- to ensure the given pubkey hashes to the right value **)
+       0xac] (** OP_CHECKSIG **)
+  in
+  let alpha = Script.hash160_bytelist scrl in
+  (alpha,scrl,secrh)
+
+let createbtchtlc alpha beta tmlock rel secr =
+  if tmlock < 17 || tmlock > 127 then raise (Failure "The code assumes the btc timelock is between 17 and 127.");
+  let secrh = sha256_bytelist (string_bytelist (hexstring_string (hashval_hexstring secr))) in
+  createbtchtlc2 alpha beta tmlock rel secrh
+
+let extract_secret_from_btctx h vout txstr : hashval =
+  let vout32 = Int32.of_int vout in
+  let l = String.length txstr in
+  if l <= 4 then raise (Failure "btc tx is impossibly short");
+  let start = if Char.code txstr.[4] = 0 then 6 else 4 in
+  let (numins,c) = sei_varint seis (txstr,l,None,start,0) in
+  let startins =
+    match c with
+    | (_,_,_,i,_) -> i
+  in
+  let numins = Int64.to_int numins in
+  let rec extract_secret i j =
+    if i < l && j < numins then
+      let (k,c) = sei_hashval seis (txstr,l,None,i,0) in
+      let (v,c) = sei_int32 seis c in
+      let k = hashval_rev k in
+      let v = int32_rev v in
+      let (sgsize,c) = sei_varint seis c in
+      let sgsize = Int64.to_int sgsize in
+      match c with
+      | (_,_,_,i,_) -> 
+         if k = h && v = vout32 then
+           begin
+             let by1 = Char.code txstr.[i] in
+             let by2 = Char.code txstr.[i + 1 + by1] in
+             let (secr,_) = sei_hashval seis (txstr,l,None,i+3+by1+by2,0) in
+             secr
+           end
+         else
+           extract_secret (i+sgsize+4) (j+1)
+    else
+      raise (Failure "could not extract secret")
+  in
+  extract_secret startins 0

@@ -1,3 +1,4 @@
+(* Copyright (c) 2022 The Proofgold Love developers *)
 (* Copyright (c) 2022 The Proofgold Lite developers *)
 (* Copyright (c) 2020-2021 The Proofgold Core developers *)
 (* Copyright (c) 2020 The Proofgold developers *)
@@ -1190,10 +1191,1075 @@ let find_marker_at_address tr beta =
   let hl = ctree_lookup_addr_assets_lsreq tr (addr_bitseq beta) in
   find_marker_in_hlist hl
 
+let commitdraft oc f g =
+  let ch = open_in f in
+  let l = input_token ch in
+  let mkcommittx blkh lr beta =
+    try
+      let (aid,bday,obl) = find_marker_at_address (CHash(lr)) beta in
+      if Int64.add bday commitment_maturation_minus_one <= blkh then (** this means 12 confirmations **)
+	Printf.fprintf oc "A commitment marker for this draft has already been published and matured.\nThe draft can be published with the publishdraft command.\n"
+      else
+	Printf.fprintf oc "A commitment marker for this draft has already been published and will mature after %Ld more blocks.\nAfter that the draft can be published with the publishdraft command.\n" (Int64.sub (Int64.add bday commitment_maturation_minus_one) blkh )
+    with Not_found ->
+      try
+	let minfee = Int64.mul 1000L !Config.defaulttxfee in (** very rough overestimate of 1K bytes for commitment tx **)
+	let (alpha,(aid,_,_,_),v) = find_spendable_utxo oc lr blkh minfee in
+	let txinl = [(alpha,aid)] in
+	let txoutl =
+	  if v >= Int64.add 10000L minfee then (** only create change if it is at least 10000 atoms ***)
+	    [(alpha,(None,Currency(Int64.sub v minfee)));(beta,(None,Marker))]
+	  else
+	    [(beta,(None,Marker))]
+	in
+	let stau = ((txinl,txoutl),([],[])) in
+	let c2 = open_out_bin g in
+	begin
+	  try
+	    Commands.signtxc oc lr stau c2 [] [] None;
+	    close_out_noerr c2;
+	    Printf.fprintf oc "The commitment transaction (to publish the marker) was created.\nTo inspect it:\n> decodetxfile %s\nTo validate it:\n> validatetxfile %s\nTo send it:\n> sendtxfile %s\n" g g g
+	  with e ->
+	    close_out_noerr c2;
+	    raise e
+	end
+      with Not_found ->
+	Printf.fprintf oc "Cannot find a spendable utxo to use to publish the marker.\n"
+  in
+  if l = "Theory" then
+    let (thyspec,nonce,gamma,_,_,_,_) = input_theoryspec ch in
+    let counter = ref 0 in
+    begin
+      match Checking.check_theoryspec counter thyspec with
+      | None -> raise (Failure "Theory spec does not check.\n")
+      | Some(thy,sg) ->
+	 match hashtheory thy with
+	 | None ->
+	    Printf.fprintf oc "Theory is empty. It is correct but an empty theory is not allowed to be published.\n"
+	 | Some(thyh) ->
+	    match get_bestblock_print_warnings oc with
+	    | None -> Printf.fprintf oc "No blocks yet\n"
+	    | Some(h,lbk,ltx) ->
+	       let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+	       let (_,_,lr,tr,_) = Db_validheadervals.dbget (hashpair lbk ltx) in
+	       try
+		 let tht = lookup_thytree tr in
+		 let _ = ottree_lookup tht (Some(thyh)) in
+		 Printf.fprintf oc "Theory %s has already been published.\n" (hashval_hexstring thyh)
+	       with Not_found ->
+		     match nonce with
+		     | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
+		     | Some(nonce) ->
+			match gamma with
+			| None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
+			| Some(gamma) ->
+			   if payaddr_p gamma then
+			     let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce thyh)) in
+			     mkcommittx blkh lr beta
+			   else
+			     raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
+    end
+  else if l = "Signature" then
+    let thyid = input_token ch in
+    let th = if thyid = "Empty" then None else Some(hexstring_hashval thyid) in
+    let (blkh,lr,tr,sr) =
+      match get_bestblock_print_warnings oc with
+      | None -> raise Not_found
+      | Some(dbh,lbk,ltx) ->
+	 let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+	 let (_,_,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
+	 (blkh,lr,tr,sr)
+    in
+    let tht = lookup_thytree tr in
+    let thy = try ottree_lookup tht th with Not_found -> raise (Failure (Printf.sprintf "Theory %s not found" thyid)) in
+    let sgt = lookup_sigtree sr in
+    let (signaspec,nonce,gamma,_,objhrev,_,prophrev) = input_signaspec ch th sgt in
+    begin
+      let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
+      let remgvknth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
+      let gvtp th1 h1 a =
+	if th1 = th then
+	  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
+	  let alpha = hashval_term_addr oid in
+	  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+	  match hlist_lookup_obj_owner true true true oid hl with
+	  | None -> false
+	  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
+	else
+	  false
+      in
+      let gvkn th1 k =
+	if th1 = th then
+	  let pid = hashtag (hashopair2 th k) 33l in
+	  let alpha = hashval_term_addr pid in
+	  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+	  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
+	  | None -> false
+	  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
+	else
+	  false
+      in
+      let counter = ref 0 in
+      match Checking.check_signaspec counter gvtp gvkn th thy sgt signaspec with
+      | None -> raise (Failure "Signature does not check.\n")
+      | Some((tml,knl),imported) ->
+	 let id = hashopair2 th (hashsigna (signaspec_signa signaspec)) in
+	 Printf.fprintf oc "Signature is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr (hashval_pub_addr id));
+	 Printf.fprintf oc "Signature imports %d signatures:\n" (List.length imported);
+	 List.iter (fun h -> Printf.fprintf oc " %s\n" (hashval_hexstring h)) imported;
+	 let oname h =
+	   try
+	     Hashtbl.find objhrev h
+	   with Not_found -> ""
+	 in
+	 let pname h =
+	   try
+	     Hashtbl.find prophrev h
+	   with Not_found -> ""
+	 in
+	 Printf.fprintf oc "Signature exports %d objects:\n" (List.length tml);
+	 List.iter (fun ((h,_),m) -> Printf.fprintf oc " '%s' %s %s\n" (oname h) (hashval_hexstring h) (match m with None -> "(opaque)" | Some(_) -> "(transparent)")) tml;
+	 Printf.fprintf oc "Signature exports %d props:\n" (List.length knl);
+	 List.iter (fun (h,_) -> Printf.fprintf oc " '%s' %s\n" (pname h) (hashval_hexstring h)) knl;
+	 let usesobjs = signaspec_uses_objs signaspec in
+	 let usesprops = signaspec_uses_props signaspec in
+	 let refusesig = ref false in
+	 Printf.fprintf oc "Signature uses %d objects:\n" (List.length usesobjs);
+	 List.iter
+	   (fun (oidpure,k) ->
+	     let oidthy = hashtag (hashopair2 th (hashpair oidpure k)) 32l in
+	     let alphapure = hashval_term_addr oidpure in
+	     let alphathy = hashval_term_addr oidthy in
+	     let nm = oname oidpure in
+	     try
+	       let (beta,r) = local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy in
+	       Printf.fprintf oc " Theory Object '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy)
+		 (addr_pfgaddrstr (payaddr_addr beta))
+		 (match r with
+		  | Some(0L) -> "free to use"
+		  | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
+	       let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+	       match hlist_lookup_obj_owner true true true oidpure hl with
+	       | None ->
+		  refusesig := true;
+		  Printf.fprintf oc "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **\n"
+		    (hashval_hexstring oidpure)
+		    (addr_pfgaddrstr alphapure)
+	       | Some(beta,r) ->
+		  Printf.fprintf oc " Pure Object '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)
+		    (addr_pfgaddrstr (payaddr_addr beta))
+		    (match r with
+		     | Some(0L) -> "free to use"
+		     | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
+	     with Not_found ->
+	       refusesig := true;
+	       Printf.fprintf oc "  Did not find owner of theory object %s at %s when checking. Unexpected case.\n"
+		 (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy))
+	   usesobjs;
+	 Printf.fprintf oc "Signature uses %d props:\n" (List.length usesprops);
+	 List.iter
+	   (fun pidpure ->
+	     let pidthy = hashtag (hashopair2 th pidpure) 33l in
+	     let alphapure = hashval_term_addr pidpure in
+	     let alphathy = hashval_term_addr pidthy in
+	     let nm = pname pidpure in
+	     try
+	       let (beta,r) = local_lookup_prop_thy_owner lr remgvknth pidthy alphathy in
+	       Printf.fprintf oc " Theory Prop '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy)
+		 (addr_pfgaddrstr (payaddr_addr beta))
+		 (match r with
+		  | Some(0L) -> "free to use"
+		  | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
+	       let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+	       match hlist_lookup_prop_owner true true true pidpure hl with
+	       | None ->
+		  Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
+		    (hashval_hexstring pidpure)
+		    (addr_pfgaddrstr alphapure)
+	       | Some(beta,r) ->
+		  Printf.fprintf oc "  Pure Prop %s (%s)\n  Owner %s: %s\n" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)
+		    (addr_pfgaddrstr (payaddr_addr beta))
+		    (match r with
+		     | Some(0L) -> "free to use"
+		     | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
+	     with Not_found ->
+	       refusesig := true;
+	       Printf.fprintf oc "  Did not find owner of theory proposition %s at %s when checking. Unexpected case.\n"
+		 (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy))
+	   usesprops;
+	 if !refusesig then
+	   Printf.fprintf oc "Cannot publish signature without resolving the issues above.\n"
+	 else
+	   match nonce with
+	   | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
+	   | Some(nonce) ->
+	      match gamma with
+	      | None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
+	      | Some(gamma) ->
+		 if payaddr_p gamma then
+		   let signaspech = hashsigna (signaspec_signa signaspec) in
+		   let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce (hashopair2 th signaspech))) in
+		   mkcommittx blkh lr beta
+		 else
+		   raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
+    end
+  else if l = "Document" then
+    let thyid = input_token ch in
+    let th = if thyid = "Empty" then None else Some(hexstring_hashval thyid) in
+    let (blkh,lr,tr,sr) =
+      match get_bestblock_print_warnings oc with
+      | None -> raise Not_found
+      | Some(dbh,lbk,ltx) ->
+	 let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+	 let (_,_,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
+	 (blkh,lr,tr,sr)
+    in
+    let tht = lookup_thytree tr in
+    let thy = try ottree_lookup tht th with Not_found -> raise (Failure (Printf.sprintf "Theory %s not found" thyid)) in
+    let sgt = lookup_sigtree sr in
+    let (dl,nonce,gamma,_,_,_,_,_,_,_,_,_,_) = input_doc ch th sgt in
+    let doch = hashdoc dl in
+    let alphadoc = hashval_pub_addr (hashopair2 th doch) in
+    let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphadoc) in
+    match hlist_lookup_asset_gen true true true (fun a -> match a with (_,_,_,DocPublication(_,_,_,_)) -> true | _ -> false) hl with
+    | Some(aid,_,_,_) ->
+       Printf.fprintf oc "Document has already been published: address %s asset id %s\n" (Cryptocurr.addr_pfgaddrstr alphadoc) (hashval_hexstring aid)
+    | None ->
+       begin
+	 let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
+	 let remgvknth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
+	 let refusecommit = ref false in
+	 let gvtp th1 h1 a =
+	   if th1 = th then
+	     let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
+	     let alpha = hashval_term_addr oid in
+	     let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+	     match hlist_lookup_obj_owner true true true oid hl with
+	     | None -> false
+	     | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
+	   else
+	     false
+	 in
+	 let gvkn th1 k =
+	   if th1 = th then
+	     let pid = hashtag (hashopair2 th k) 33l in
+	     let alpha = hashval_term_addr pid in
+	     let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+	     match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
+	     | None -> false
+	     | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
+	   else
+	     false
+	 in
+         let counter = ref 0 in
+	 match Checking.check_doc counter gvtp gvkn th thy sgt dl with
+	 | None -> raise (Failure "Document does not check.\n")
+	 | Some(_) ->
+	    let id = hashopair2 th (hashdoc dl) in
+	    Printf.fprintf oc "Document is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr (hashval_pub_addr id));
+	    let usesobjs = doc_uses_objs dl in
+	    let usesprops = doc_uses_props dl in
+	    Printf.fprintf oc "Document uses %d objects:\n" (List.length usesobjs);
+	    List.iter
+	      (fun (oidpure,k) ->
+		let oidthy = hashtag (hashopair2 th (hashpair oidpure k)) 32l in
+		let alphapure = hashval_term_addr oidpure in
+		let alphathy = hashval_term_addr oidthy in
+		try
+		  let (beta,r) = local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy in
+		  Printf.fprintf oc "  Theory Object %s (%s) Owner %s: %s\n" (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy)
+		    (addr_pfgaddrstr (payaddr_addr beta))
+		    (match r with
+		     | None -> refusecommit := true; "No right to use; document cannot be published unless this is redefined.\n"
+		     | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
+		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+		  match hlist_lookup_obj_owner true true true oidpure hl with
+		  | None ->
+		     Printf.fprintf oc "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **\n"
+		       (hashval_hexstring oidpure)
+		       (addr_pfgaddrstr alphapure)
+		  | Some(beta,r) ->
+		     Printf.fprintf oc "  Pure Object %s (%s) Owner %s: %s\n" (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)
+		       (addr_pfgaddrstr (payaddr_addr beta))
+		       (match r with
+			| None -> refusecommit := true; "No right to use; document cannot be published unless this is redefined.\n"
+			| Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
+		with Not_found ->
+		  refusecommit := true;
+		  Printf.fprintf oc "  Did not find owner of theory object %s at %s when checking. Unexpected case.\n"
+		    (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy))
+	      usesobjs;
+	    Printf.fprintf oc "Document uses %d props:\n" (List.length usesprops);
+	    List.iter
+	      (fun pidpure ->
+		let pidthy = hashtag (hashopair2 th pidpure) 33l in
+		let alphapure = hashval_term_addr pidpure in
+		let alphathy = hashval_term_addr pidthy in
+		try
+		  let (beta,r) = local_lookup_prop_thy_owner lr remgvknth pidthy alphathy in
+		  Printf.fprintf oc "  Theory Prop %s (%s) Owner %s: %s\n" (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy)
+		    (addr_pfgaddrstr (payaddr_addr beta))
+		    (match r with
+		     | None -> refusecommit := true; "No right to use; document cannot be published unless this is reproven."
+		     | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
+		  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+		  match hlist_lookup_prop_owner true true true pidpure hl with
+		  | None ->
+		     Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
+		       (hashval_hexstring pidpure)
+		       (addr_pfgaddrstr alphapure)
+		  | Some(beta,r) ->
+		     Printf.fprintf oc "  Pure Prop %s (%s) Owner %s: %s\n" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)
+		       (addr_pfgaddrstr (payaddr_addr beta))
+		       (match r with
+			| None -> refusecommit := true; "No right to use; document cannot be published unless this is reproven."
+			| Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
+		with Not_found ->
+		  refusecommit := true;
+		  Printf.fprintf oc "  Did not find owner of theory proposition %s at %s when checking. Unexpected case.\n"
+		    (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy))
+	      usesprops;
+	    if !refusecommit then
+	      Printf.fprintf oc "Refusing to commit to the draft until the issues above are resolved.\n"
+	    else
+	      match nonce with
+	      | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
+	      | Some(nonce) ->
+		 match gamma with
+		 | None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
+		 | Some(gamma) ->
+		    if payaddr_p gamma then
+		      let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce (hashopair2 th doch))) in
+		      mkcommittx blkh lr beta
+		    else
+		      raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
+       end
+  else
+    begin
+      close_in_noerr ch;
+      raise (Failure (Printf.sprintf "Draft file has incorrect header: %s" l))
+    end
+  
+let publishdraft oc f g =
+  let ch = open_in f in
+  let l = input_token ch in
+  if l = "Theory" then
+    let (thyspec,nonce,gamma,_,_,propownsh,proprightsh) = input_theoryspec ch in
+    begin
+      let counter = ref 0 in
+      match Checking.check_theoryspec counter thyspec with
+      | None -> raise (Failure "Theory spec does not check.\n")
+      | Some(thy,sg) ->
+	 match hashtheory thy with
+	 | None ->
+	    Printf.fprintf oc "Theory is empty. It is correct but an empty theory is not allowed to be published.\n"
+	 | Some(thyh) ->
+	    match get_bestblock_print_warnings oc with
+	    | None -> Printf.fprintf oc "No blocks yet\n"
+	    | Some(h,lbk,ltx) ->
+	       let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+	       let (_,_,lr,tr,_) = Db_validheadervals.dbget (hashpair lbk ltx) in
+	       try
+		 let tht = lookup_thytree tr in
+		 let _ = ottree_lookup tht (Some(thyh)) in
+		 Printf.fprintf oc "Theory %s has already been published.\n" (hashval_hexstring thyh)
+	       with Not_found ->
+		     match nonce with
+		     | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
+		     | Some(h) ->
+			match gamma with
+			| None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
+			| Some(gamma) ->
+			   if payaddr_p gamma then
+			     let gammap = let (i,x0,x1,x2,x3,x4) = gamma in (i = 1,x0,x1,x2,x3,x4) in
+			     let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair h thyh)) in
+			     begin
+			       try
+				 let (markerid,bday,obl) = find_marker_at_address (CHash(lr)) beta in
+				 try
+				   if Int64.add bday commitment_maturation_minus_one <= blkh then
+				     begin
+				       let b = theoryspec_burncost thyspec in
+				       try
+					 let delta = hashval_pub_addr thyh in
+					 let txoutl = [(delta,(None,TheoryPublication(gammap,h,thyspec)))] in
+					 let txoutlr = ref txoutl in
+					 let (_,kl) = thy in
+					 List.iter
+					   (fun h ->
+                                             let pidpure = h in
+				             let pidthy = hashtag (hashopair2 (Some(thyh)) pidpure) 33l in
+				             let alphapure = hashval_term_addr pidpure in
+				             let alphathy = hashval_term_addr pidthy in
+					     let gamma1p =
+					       try
+						 Hashtbl.find propownsh h
+					       with Not_found -> gammap
+					     in
+					     let (gamma2pp,rpp) =
+					       try
+						 Hashtbl.find proprightsh (false,h)
+					       with Not_found -> (gamma1p,Some(0L))
+					     in
+					     let (gamma2tp,rtp) =
+					       try
+						 Hashtbl.find proprightsh (true,h)
+					       with Not_found -> (gamma1p,Some(0L))
+					     in
+                                             begin
+				               let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+				               match hlist_lookup_prop_owner true true true pidpure hl with
+                                               | Some(_,_) -> () (** pure version already owned **)
+				               | None -> (** pure version not owned yet **)
+						  txoutlr := (alphapure,(Some(gamma1p,0L,false),OwnsProp(pidpure,gamma2pp,rpp)))::!txoutlr
+                                             end;
+                                             (** the theory version cannot be previously owned unless the exact theory was already published, in which case the theory should not be republished **)
+                                             txoutlr := (alphathy,(Some(gamma1p,0L,false),OwnsProp(pidthy,gamma2tp,rtp)))::!txoutlr)
+					   kl;
+					 let esttxbytes = 2000 + stxsize (([],!txoutlr),([],[])) in (** rough overestimate for txin and signatures at 2000 bytes **)
+					 let minfee = Int64.mul (Int64.of_int esttxbytes) !Config.defaulttxfee in
+					 let minamt = Int64.add b minfee in
+					 let (alpha,(aid,_,_,_),v) = find_spendable_utxo oc lr blkh minamt in
+					 let change = Int64.sub v minamt in
+					 if change >= 10000L then txoutlr := (alpha,(None,Currency(change)))::!txoutlr;
+					 let txinl = [(alpha,aid);(beta,markerid)] in
+					 let stau = ((txinl,!txoutlr),([],[])) in
+					 let c2 = open_out_bin g in
+					 begin
+					   try
+					     Commands.signtxc oc lr stau c2 [] [] None;
+					     let p = pos_out c2 in
+					     close_out_noerr c2;
+					     if p > 450000 then Printf.fprintf oc "Warning: The transaction has %d bytes and may be too large to be confirmed in a block.\n" p;
+					     Printf.fprintf oc "The transaction to publish the theory was created.\nTo inspect it:\n> decodetxfile %s\nTo validate it:\n> validatetxfile %s\nTo send it:\n> sendtxfile %s\n" g g g
+					   with e ->
+					     close_out_noerr c2;
+					     raise e
+					 end
+				       with Not_found ->
+					 Printf.fprintf oc "Cannot find a spendable utxo to use to publish the marker.\n"
+				     end
+				   else
+				     Printf.fprintf oc "The commitment will mature after %Ld more blocks.\nThe draft can only be published after the commitment matures.\n" (Int64.sub (Int64.add bday commitment_maturation_minus_one) blkh)
+				 with Not_found -> Printf.fprintf oc "Could not find a utxo sufficient to fund publication tx.\n"
+			       with Not_found ->
+				 Printf.fprintf oc "No commitment marker for this draft found.\nUse commitdraft to create and publish a commitment marker.\n"
+			     end
+			   else
+			     raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
+    end
+  else if l = "Signature" then
+    let thyid = input_token ch in
+    let th = if thyid = "Empty" then None else Some(hexstring_hashval thyid) in
+    let (blkh,lr,tr,sr) =
+      match get_bestblock_print_warnings oc with
+      | None -> raise Not_found
+      | Some(dbh,lbk,ltx) ->
+	 let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+	 let (_,_,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
+	 (blkh,lr,tr,sr)
+    in
+    let tht = lookup_thytree tr in
+    let thy = try ottree_lookup tht th with Not_found -> raise (Failure (Printf.sprintf "Theory %s not found" thyid)) in
+    let sgt = lookup_sigtree sr in
+    let (signaspec,nonce,gamma,_,objhrev,_,prophrev) = input_signaspec ch th sgt in
+    begin
+      let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
+      let remgvknth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
+      let gvtp th1 h1 a =
+	if th1 = th then
+	  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
+	  let alpha = hashval_term_addr oid in
+	  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+	  match hlist_lookup_obj_owner true true true oid hl with
+	  | None -> false
+	  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
+	else
+	  false
+      in
+      let gvkn th1 k =
+	if th1 = th then
+	  let pid = hashtag (hashopair2 th k) 33l in
+	  let alpha = hashval_term_addr pid in
+	  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+	  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
+	  | None -> false
+	  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
+	else
+	  false
+      in
+      let counter = ref 0 in
+      match Checking.check_signaspec counter gvtp gvkn th thy sgt signaspec with
+      | None -> raise (Failure "Signature does not check.\n")
+      | Some((tml,knl),imported) ->
+	 let id = hashopair2 th (hashsigna (signaspec_signa signaspec)) in
+	 let delta = hashval_pub_addr id in
+	 let hldelta = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq delta) in
+	 if not (hldelta = HNil) then raise (Failure "Signature already seems to have been published.");
+	 Printf.fprintf oc "Signature is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr (hashval_pub_addr id));
+	 Printf.fprintf oc "Signature imports %d signatures:\n" (List.length imported);
+	 List.iter (fun h -> Printf.fprintf oc " %s\n" (hashval_hexstring h)) imported;
+	 let oname h =
+	   try
+	     Hashtbl.find objhrev h
+	   with Not_found -> ""
+	 in
+	 let pname h =
+	   try
+	     Hashtbl.find prophrev h
+	   with Not_found -> ""
+	 in
+	 Printf.fprintf oc "Signature exports %d objects:\n" (List.length tml);
+	 List.iter (fun ((h,_),m) -> Printf.fprintf oc " '%s' %s %s\n" (oname h) (hashval_hexstring h) (match m with None -> "(opaque)" | Some(_) -> "(transparent)")) tml;
+	 Printf.fprintf oc "Signature exports %d props:\n" (List.length knl);
+	 List.iter (fun (h,_) -> Printf.fprintf oc " '%s' %s\n" (pname h) (hashval_hexstring h)) knl;
+	 let usesobjs = signaspec_uses_objs signaspec in
+	 let usesprops = signaspec_uses_props signaspec in
+	 let refusesig = ref false in
+	 Printf.fprintf oc "Signature uses %d objects:\n" (List.length usesobjs);
+	 List.iter
+	   (fun (oidpure,k) ->
+	     let oidthy = hashtag (hashopair2 th (hashpair oidpure k)) 32l in
+	     let alphapure = hashval_term_addr oidpure in
+	     let alphathy = hashval_term_addr oidthy in
+	     let nm = oname oidpure in
+	     try
+	       let (beta,r) = local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy in
+	       Printf.fprintf oc " Theory Object '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy)
+		 (addr_pfgaddrstr (payaddr_addr beta))
+		 (match r with
+		  | Some(0L) -> "free to use"
+		  | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
+	       let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+	       match hlist_lookup_obj_owner true true true oidpure hl with
+	       | None ->
+		  refusesig := true;
+		  Printf.fprintf oc "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **\n"
+		    (hashval_hexstring oidpure)
+		    (addr_pfgaddrstr alphapure)
+	       | Some(beta,r) ->
+		  Printf.fprintf oc " Pure Object '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)
+		    (addr_pfgaddrstr (payaddr_addr beta))
+		    (match r with
+		     | Some(0L) -> "free to use"
+		     | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
+	     with Not_found ->
+	       refusesig := true;
+	       Printf.fprintf oc "  Did not find owner of theory object %s at %s when checking. Unexpected case.\n"
+		 (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy))
+	   usesobjs;
+	 Printf.fprintf oc "Signature uses %d props:\n" (List.length usesprops);
+	 List.iter
+	   (fun pidpure ->
+	     let pidthy = hashtag (hashopair2 th pidpure) 33l in
+	     let alphapure = hashval_term_addr pidpure in
+	     let alphathy = hashval_term_addr pidthy in
+	     let nm = pname pidpure in
+	     try
+	       let (beta,r) = local_lookup_prop_thy_owner lr remgvknth pidthy alphathy in
+	       Printf.fprintf oc " Theory Prop '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy)
+		 (addr_pfgaddrstr (payaddr_addr beta))
+		 (match r with
+		  | Some(0L) -> "free to use"
+		  | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
+	       let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+	       match hlist_lookup_prop_owner true true true pidpure hl with
+	       | None ->
+		  Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
+		    (hashval_hexstring pidpure)
+		    (addr_pfgaddrstr alphapure)
+	       | Some(beta,r) ->
+		  Printf.fprintf oc "  Pure Prop %s (%s)\n  Owner %s: %s\n" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)
+		    (addr_pfgaddrstr (payaddr_addr beta))
+		    (match r with
+		     | Some(0L) -> "free to use"
+		     | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
+	     with Not_found ->
+	       refusesig := true;
+	       Printf.fprintf oc "  Did not find owner of theory proposition %s at %s when checking. Unexpected case.\n"
+		 (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy))
+	   usesprops;
+	 if !refusesig then
+	   Printf.fprintf oc "Cannot publish signature without resolving the issues above.\n"
+	 else
+	   match nonce with
+	   | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
+	   | Some(nonce) ->
+	      match gamma with
+	      | None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
+	      | Some(gamma) ->
+		 if payaddr_p gamma then
+		   let gammap = let (i,x0,x1,x2,x3,x4) = gamma in (i = 1,x0,x1,x2,x3,x4) in
+		   let signaspech = hashsigna (signaspec_signa signaspec) in
+		   let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce (hashopair2 th signaspech))) in
+		   begin
+		     try
+		       let (markerid,bday,obl) = find_marker_at_address (CHash(lr)) beta in
+		       try
+			 if Int64.add bday commitment_maturation_minus_one <= blkh then
+			   begin
+			     let b = signaspec_burncost signaspec in
+			     let txinlr = ref [(beta,markerid)] in
+			     let txoutlr = ref [(delta,(None,SignaPublication(gammap,nonce,th,signaspec)))] in
+			     let esttxbytes = 2000 + stxsize (([],!txoutlr),([],[])) in (** rough overestimate for txin, possible change and signatures at 2000 bytes **)
+			     let minfee = Int64.mul (Int64.of_int esttxbytes) !Config.defaulttxfee in
+			     let tospend = ref (Int64.add b minfee) in
+			     try
+			       let (alpha,(aid,_,_,_),v) = find_spendable_utxo oc lr blkh !tospend in
+			       let tauin = (alpha,aid)::!txinlr in
+			       let tauout = if Int64.sub v !tospend >= 10000L then (alpha,(None,Currency(Int64.sub v !tospend)))::!txoutlr else !txoutlr in
+			       let stau = ((tauin,tauout),([],[])) in
+			       let c2 = open_out_bin g in
+			       begin
+				 try
+				   Commands.signtxc oc lr stau c2 [] [] None;
+				   let p = pos_out c2 in
+				   close_out_noerr c2;
+				   if p > 450000 then Printf.fprintf oc "Warning: The transaction has %d bytes and may be too large to be confirmed in a block.\n" p;
+				   Printf.fprintf oc "The transaction to publish the signature was created.\nTo inspect it:\n> decodetxfile %s\nTo validate it:\n> validatetxfile %s\nTo send it:\n> sendtxfile %s\n" g g g
+				 with e ->
+				   close_out_noerr c2;
+				   raise e
+			       end
+			     with Not_found -> Printf.fprintf oc "Could not find a utxo sufficient to fund publication tx.\n"
+			   end
+			 else
+			   Printf.fprintf oc "The commitment will mature after %Ld more blocks.\nThe draft can only be published after the commitment matures.\n" (Int64.sub (Int64.add bday commitment_maturation_minus_one) blkh)
+		       with Not_found -> Printf.fprintf oc "Not_found was raised while trying to construct the publication tx.\n"
+		     with Not_found ->
+		       Printf.fprintf oc "No commitment marker for this draft found.\nUse commitdraft to create and publish a commitment marker.\n"
+		   end
+		 else
+		   raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
+    end
+  else if l = "Document" then
+    let thyid = input_token ch in
+    let th = if thyid = "Empty" then None else Some(hexstring_hashval thyid) in
+    let addrh : (payaddr,int64) Hashtbl.t = Hashtbl.create 10 in
+    let (blkh,lr,tr,sr) =
+      match get_bestblock_print_warnings oc with
+      | None -> raise Not_found
+      | Some(dbh,lbk,ltx) ->
+	 let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+	 let (_,_,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
+	 (blkh,lr,tr,sr)
+    in
+    let tht = lookup_thytree tr in
+    let thy = try ottree_lookup tht th with Not_found -> raise (Failure (Printf.sprintf "Theory %s not found" thyid)) in
+    let sgt = lookup_sigtree sr in
+    let (dl,nonce,gamma,paramh,objhrev,proph,prophrev,conjh,objownsh,objrightsh,propownsh,proprightsh,bountyh) = input_doc ch th sgt in
+    let id = hashopair2 th (hashdoc dl) in
+    let delta = hashval_pub_addr id in
+    let hldelta = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq delta) in
+    if not (hldelta = HNil) then raise (Failure "Document already seems to have been published.");
+    begin
+      let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
+      let remgvknth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
+      let gvtp th1 h1 a =
+	if th1 = th then
+	  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
+	  let alpha = hashval_term_addr oid in
+	  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+	  match hlist_lookup_obj_owner true true true oid hl with
+	  | None -> false
+	  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
+	else
+	  false
+      in
+      let gvkn th1 k =
+	if th1 = th then
+	  let pid = hashtag (hashopair2 th k) 33l in
+	  let alpha = hashval_term_addr pid in
+	  let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alpha) in
+	  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
+	  | None -> false
+	  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
+	else
+	  false
+      in
+      let counter = ref 0 in
+      match Checking.check_doc counter gvtp gvkn th thy sgt dl with
+      | None -> raise (Failure "Document does not check.\n")
+      | Some(_) ->
+	 Printf.fprintf oc "Document is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr delta);
+	 match nonce with
+	 | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
+	 | Some(nonce) ->
+	    match gamma with
+	    | None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
+	    | Some(gamma) ->
+	       if payaddr_p gamma then
+		 let gammap = let (i,x0,x1,x2,x3,x4) = gamma in (i = 1,x0,x1,x2,x3,x4) in
+		 let doch = hashdoc dl in
+		 let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce (hashopair2 th doch))) in
+		 begin
+		   try
+		     let (markerid,bday,obl) = find_marker_at_address (CHash(lr)) beta in
+		     try
+		       if Int64.add bday commitment_maturation_minus_one <= blkh then
+			 begin
+			   let tospend = ref 0L in
+			   let al = ref [(markerid,bday,obl,Marker)] in
+			   let txinlr = ref [(beta,markerid)] in
+			   let txoutlr = ref [(delta,(None,DocPublication(gammap,nonce,th,dl)))] in
+                           let revisituses = ref [] in
+			   let usesobjs = doc_uses_objs dl in
+			   let usesprops = doc_uses_props dl in
+			   let createsobjs = doc_creates_objs dl in
+			   let createsprops = doc_creates_props dl in
+			   let createsnegpropsaddrs2 = List.map (fun h -> hashval_term_addr (hashtag (hashopair2 th h) 33l)) (doc_creates_neg_props dl) in
+			   let objrightsassets : (hashval,addr * asset) Hashtbl.t = Hashtbl.create 10 in
+			   let proprightsassets : (hashval,addr * asset) Hashtbl.t = Hashtbl.create 10 in
+			   List.iter
+			     (fun (alpha,a,v) ->
+			       match a with
+			       | (_,_,_,RightsObj(h,_)) -> Hashtbl.add objrightsassets h (alpha,a)
+			       | (_,_,_,RightsProp(h,_)) -> Hashtbl.add proprightsassets h (alpha,a)
+			       | _ -> ())
+			     (Commands.get_spendable_assets_in_ledger oc lr blkh);
+			   let oname h =
+			     try
+			       Hashtbl.find objhrev h
+			     with Not_found -> ""
+			   in
+			   let pname h =
+			     try
+			       Hashtbl.find prophrev h
+			     with Not_found -> ""
+			   in
+			   List.iter
+			     (fun (oidpure,k) ->
+			       let oidthy = hashtag (hashopair2 th (hashpair oidpure k)) 32l in
+			       let alphapure = hashval_term_addr oidpure in
+			       let alphathy = hashval_term_addr oidthy in
+			       let (beta,r) = local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy in
+			       begin
+				 match r with
+				 | None -> raise (Failure (Printf.sprintf "No right to use theory object '%s' %s. It must be redefined." (oname oidpure) (hashval_hexstring oidthy)))
+				 | Some(i) when i > 0L -> (*** look for owned rights; if not increase 'tospend' to buy the rights ***)
+				    begin
+                                      revisituses := (false,oidthy,beta,i)::!revisituses;
+                                      if Hashtbl.mem objrightsassets oidthy then
+                                        begin
+                                          try
+                                            let i2 = Hashtbl.find addrh beta in
+                                            if i > i2 then Hashtbl.replace addrh beta i
+                                          with Not_found ->
+                                            Hashtbl.add addrh beta i
+                                        end
+                                    end
+				 | _ -> ()
+			       end;
+			       begin
+				 let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+				 match hlist_lookup_obj_owner true true true oidpure hl with
+				 | None -> raise (Failure (Printf.sprintf "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **" (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)))
+				 | Some(beta,r) ->
+				    match r with
+				    | None -> raise (Failure (Printf.sprintf "No right to use pure object '%s' %s. It must be redefined." (oname oidpure) (hashval_hexstring oidpure)))
+				    | Some(i) when i > 0L -> (*** look for owned rights; if not increase 'tospend' to buy the rights ***)
+				       begin
+                                         revisituses := (false,oidpure,beta,i)::!revisituses;
+                                         if Hashtbl.mem objrightsassets oidpure then
+                                           begin
+                                             try
+                                               let i2 = Hashtbl.find addrh beta in
+                                               if i > i2 then Hashtbl.replace addrh beta i
+                                             with Not_found ->
+                                               Hashtbl.add addrh beta i
+                                           end
+                                       end
+				    | _ -> ()
+			       end)
+			     usesobjs;
+			   List.iter
+			     (fun pidpure ->
+			       let pidthy = hashtag (hashopair2 th pidpure) 33l in
+			       let alphapure = hashval_term_addr pidpure in
+			       let alphathy = hashval_term_addr pidthy in
+			       let (beta,r) = local_lookup_prop_thy_owner lr remgvknth pidthy alphathy in
+			       begin
+				 match r with
+				 | None -> raise (Failure (Printf.sprintf "No right to use theory proposition '%s' %s. It must be reproven." (pname pidpure) (hashval_hexstring pidthy)))
+				 | Some(i) when i > 0L -> (*** look for owned rights; if not increase 'tospend' to buy the rights ***)
+				    begin
+                                      revisituses := (true,pidthy,beta,i)::!revisituses;
+                                      if Hashtbl.mem proprightsassets pidthy then
+                                        begin
+					  try
+                                            let i2 = Hashtbl.find addrh beta in
+                                            if i > i2 then Hashtbl.replace addrh beta i
+                                          with Not_found ->
+                                            Hashtbl.add addrh beta i
+                                        end
+				    end
+				 | _ -> ()
+			       end;
+			       begin
+				 let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+				 match hlist_lookup_prop_owner true true true pidpure hl with
+				 | None -> raise (Failure (Printf.sprintf "** Somehow the theory proposition has an owner but the pure object %s (%s) did not. Invariant failure. **" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)))
+				 | Some(beta,r) ->
+				    match r with
+				    | None -> raise (Failure (Printf.sprintf "No right to use pure proposition '%s' %s. It must be reproven." (pname pidpure) (hashval_hexstring pidpure)))
+				    | Some(i) when i > 0L -> (*** look for owned rights; if not increase 'tospend' to buy the rights ***)
+				       begin
+                                         revisituses := (true,pidpure,beta,i)::!revisituses;
+                                         if Hashtbl.mem proprightsassets pidpure then
+                                           begin
+					     try
+                                               let i2 = Hashtbl.find addrh beta in
+                                               if i > i2 then Hashtbl.replace addrh beta i
+                                             with Not_found ->
+                                               Hashtbl.add addrh beta i
+                                           end
+				       end
+				    | _ -> ()
+			       end)
+			     usesprops;
+                           Hashtbl.iter
+                             (fun beta m ->
+                               tospend := Int64.add !tospend m;
+                               txoutlr := (payaddr_addr beta,(None,Currency(m)))::!txoutlr)
+                             addrh;
+                           List.iter
+                             (fun (b1,h1,beta1,i1) ->
+                               try
+                                 let i2 = Hashtbl.find addrh beta1 in
+                                 if i2 < i1 then raise Not_found;
+                               with Not_found ->
+                                 try
+                                   let (alpha,a) = Hashtbl.find (if b1 then proprightsassets else objrightsassets) h1 in
+				   match a with
+				   | (aid,bday,obl,RightsObj(h,r)) when not b1 ->
+				      if r > 0L then
+					begin
+					  al := a::!al;
+					  txinlr := (alpha,aid)::!txinlr;
+                                          if r > 1L then txoutlr := (alpha,(obl,RightsObj(h,Int64.sub r 1L)))::!txoutlr;
+                                        end
+                                      else
+                                        raise Not_found
+				   | (aid,bday,obl,RightsProp(h,r)) when b1 ->
+				      if r > 0L then
+					begin
+					  al := a::!al;
+					  txinlr := (alpha,aid)::!txinlr;
+                                          if r > 1L then txoutlr := (alpha,(obl,RightsProp(h,Int64.sub r 1L)))::!txoutlr;
+                                        end
+                                      else
+                                        raise Not_found
+                                   | _ ->
+                                      raise Not_found
+                                 with Not_found ->
+                                   raise (Failure (Printf.sprintf "Problem obtaining rights for %s" (hashval_hexstring h1))))
+                             !revisituses;
+			   List.iter
+			     (fun (h,k) ->
+			       let oidpure = h in
+			       let oidthy = hashtag (hashopair2 th (hashpair h k)) 32l in
+			       let alphapure = hashval_term_addr oidpure in
+			       let alphathy = hashval_term_addr oidthy in
+			       let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			       begin
+				 match hlist_lookup_obj_owner true true true oidpure hl with
+				 | Some(_) -> ()
+				 | None ->
+				    let delta1 = try Hashtbl.find objownsh oidpure with Not_found -> gammap in
+				    let (delta2,r) = try Hashtbl.find objrightsh (false,oidpure) with Not_found -> (gammap,Some(0L)) in
+				    txoutlr := (alphapure,(Some(delta1,0L,false),OwnsObj(oidpure,delta2,r)))::!txoutlr
+			       end;
+			       let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+			       begin
+				 match hlist_lookup_obj_owner true true true oidthy hl with
+				 | Some(_) -> ()
+				 | None ->
+				    let delta1 = try Hashtbl.find objownsh oidpure with Not_found -> gammap in
+				    let (delta2,r) = try Hashtbl.find objrightsh (true,oidpure) with Not_found -> (gammap,Some(0L)) in
+				    txoutlr := (alphathy,(Some(delta1,0L,false),OwnsObj(oidthy,delta2,r)))::!txoutlr
+			       end)
+			     createsobjs;
+			   List.iter
+			     (fun pidpure ->
+			       let pidthy = hashtag (hashopair2 th pidpure) 33l in
+			       let alphapure = hashval_term_addr pidpure in
+			       let alphathy = hashval_term_addr pidthy in
+			       let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphapure) in
+			       begin
+				 match hlist_lookup_prop_owner true true true pidpure hl with
+				 | Some(_) -> ()
+				 | None ->
+				    let delta1 = try Hashtbl.find propownsh pidpure with Not_found -> gammap in
+				    let (delta2,r) = try Hashtbl.find proprightsh (false,pidpure) with Not_found -> (gammap,Some(0L)) in
+				    txoutlr := (alphapure,(Some(delta1,0L,false),OwnsProp(pidpure,delta2,r)))::!txoutlr
+			       end;
+			       let hl = ctree_lookup_addr_assets true true (CHash(lr)) (addr_bitseq alphathy) in
+			       begin
+				 match hlist_lookup_prop_owner true true true pidthy hl with
+				 | Some(_) -> ()
+				 | None ->
+				    let delta1 = try Hashtbl.find propownsh pidpure with Not_found -> gammap in
+				    let (delta2,r) = try Hashtbl.find proprightsh (true,pidpure) with Not_found -> (gammap,Some(0L)) in
+				    txoutlr := (alphathy,(Some(delta1,0L,false),OwnsProp(pidthy,delta2,r)))::!txoutlr
+			       end)
+			     createsprops;
+			   List.iter
+			     (fun alpha -> txoutlr := (alpha,(Some(gammap,0L,false),OwnsNegProp))::!txoutlr)
+			     createsnegpropsaddrs2;
+			   Hashtbl.iter
+			     (fun pidpure (amt,olkh) ->
+			       let pidthy = hashtag (hashopair2 th pidpure) 33l in
+			       let alphathy = hashval_term_addr pidthy in
+			       tospend := Int64.add amt !tospend;
+			       match olkh with
+			       | None -> txoutlr := (alphathy,(None,Bounty(amt)))::!txoutlr
+			       | Some(deltap,lkh) -> txoutlr := (alphathy,(Some(deltap,lkh,false),Bounty(amt)))::!txoutlr)
+			     bountyh;
+			   try
+			     let esttxbytes = 2000 + stxsize ((!txinlr,!txoutlr),([],[])) + 200 * estimate_required_signatures !al (!txinlr,!txoutlr) in (** rough overestimate for funding asset, possible change and signature for the funding asset 2000 bytes; overestimate of 200 bytes per other signature **)
+			     let minfee = Int64.mul (Int64.of_int esttxbytes) !Config.defaulttxfee in
+			     tospend := Int64.add !tospend minfee;
+			     let (alpha,(aid,_,_,_),v) = find_spendable_utxo oc lr blkh !tospend in
+			     let tauin = (alpha,aid)::!txinlr in
+			     let tauout = if Int64.sub v !tospend > 10000L then (alpha,(None,Currency(Int64.sub v !tospend)))::!txoutlr else !txoutlr in
+			     let stau = ((tauin,tauout),([],[])) in
+			     let c2 = open_out_bin g in
+			     begin
+			       try
+				 Commands.signtxc oc lr stau c2 [] [] None;
+				 let p = pos_out c2 in
+				 close_out_noerr c2;
+				 if p > 450000 then Printf.fprintf oc "Warning: The transaction has %d bytes and may be too large to be confirmed in a block.\n" p;
+				 Printf.fprintf oc "The transaction to publish the document was created.\nTo inspect it:\n> decodetxfile %s\nTo validate it:\n> validatetxfile %s\nTo send it:\n> sendtxfile %s\n" g g g
+			       with e ->
+				 close_out_noerr c2;
+				 raise e
+			     end
+			   with Not_found -> Printf.fprintf oc "Could not find a utxo sufficient to fund publication tx.\n"
+			 end
+		       else
+			 Printf.fprintf oc "The commitment will mature after %Ld more blocks.\nThe draft can only be published after the commitment matures.\n" (Int64.sub (Int64.add bday commitment_maturation_minus_one) blkh)
+		     with Not_found -> Printf.fprintf oc "Not_found was raised while trying to create the publication tx.\n"
+		   with Not_found ->
+		     Printf.fprintf oc "No commitment marker for this draft found.\nUse commitdraft to create and publish a commitment marker.\n"
+		 end
+	       else
+		 raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
+    end
+    else
+      begin
+	close_in_noerr ch;
+	raise (Failure (Printf.sprintf "Draft file has incorrect header: %s" l))
+      end
+
+let sendtxfile oc s =
+  begin
+    match get_bestblock_print_warnings oc with
+    | None -> Printf.fprintf oc "Cannot find best block.\n"
+    | Some(dbh,lbk,ltx) ->
+       try
+	 let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
+	 let (_,tm,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
+	 let c = open_in_bin s in
+	 let (stau,_) = Tx.sei_stx seic (c,None) in
+	 let txbytes = pos_in c in
+	 close_in_noerr c;
+	 if txbytes > 450000 then
+	   Printf.fprintf oc "Refusing to send tx > 450K bytes\n"
+	 else
+	   Commands.sendtx2 oc (Int64.add 1L blkh) tm tr sr lr txbytes stau
+       with Not_found ->
+	 Printf.fprintf oc "Cannot find block height for best block %s\n" (hashval_hexstring dbh)
+  end
+  
 let initialize_commands () =
   ac "version" "version" "Print client description and version number"
     (fun oc _ ->
       Printf.fprintf oc "%s %s\n" Version.clientdescr Version.clientversion);
+  ac "sleep" "sleep <seconds>" "Sleep for given number of seconds"
+    (fun oc al ->
+      match al with
+      | [m] -> Thread.delay (float_of_string m)
+      | _ -> raise BadCommandForm);
+  ac "decodeheader" "decodeheader <hex>" "decode header given in hex into json"
+    (fun oc al ->
+      match al with
+      | [h] ->
+         let hs = hexstring_string h in
+         let (bh,_) = sei_blockheader seis (hs,String.length hs,None,0,0) in
+         let (bhd,bhs) = bh in
+	 let pbh = bhd.prevblockhash in
+	 let alpha = bhd.stakeaddr in
+	 let aid = bhd.stakeassetid in
+	 let timestamp = bhd.timestamp in
+	 let deltatime = bhd.deltatime in
+	 let tinfo = bhd.tinfo in
+	 let bblkh =
+	   try
+	     match pbh with
+	     | Some(_,Poburn(plbk,pltx,_,_,_,_)) ->
+		let (_,_,_,_,_,_,pblkh) = Db_outlinevals.dbget (hashpair plbk pltx) in
+		Some(Int64.add pblkh 1L)
+	     | None -> Some(1L)
+	   with Not_found ->
+	     None
+	 in
+	 let jpb =
+	   match pbh with
+	   | None -> []
+	   | Some(prevh,Poburn(lblkh,ltxh,lmedtm,burned,txid1,vout1)) ->
+	      match bblkh with
+	      | Some(bblkh) ->
+		 [("height",JsonNum(Int64.to_string bblkh));
+		  ("prevblock",
+		   JsonObj([("block",JsonStr(hashval_hexstring prevh));
+			    ("ltcblock",JsonStr(hashval_hexstring lblkh));
+			    ("ltcburntx",JsonStr(hashval_hexstring ltxh));
+			    ("ltcmedtm",JsonNum(Int64.to_string lmedtm));
+			    ("ltcburned",JsonNum(Int64.to_string burned));
+                            ("txid1",JsonStr(hashval_hexstring txid1));
+                            ("vout1",JsonNum(Int32.to_string vout1))]))]
+	      | None ->
+		 [("prevblock",
+		   JsonObj([("block",JsonStr(hashval_hexstring prevh));
+			    ("ltcblock",JsonStr(hashval_hexstring lblkh));
+			    ("ltcburntx",JsonStr(hashval_hexstring ltxh));
+			    ("ltcmedtm",JsonNum(Int64.to_string lmedtm));
+			    ("ltcburned",JsonNum(Int64.to_string burned));
+                            ("txid1",JsonStr(hashval_hexstring txid1));
+                            ("vout1",JsonNum(Int32.to_string vout1))]))]
+	 in
+	 let jr =
+	   jpb @
+	     [("stakeaddress",JsonStr(addr_pfgaddrstr (p2pkhaddr_addr alpha)));
+	      ("stakeassetid",JsonStr(hashval_hexstring aid));
+	      ("timestamp",JsonNum(Int64.to_string timestamp));
+	      ("deltatime",JsonNum(Int32.to_string deltatime));
+	      ("prevledgerroot",JsonStr(hashval_hexstring (ctree_hashroot bhd.prevledger)));
+	      ("newledgerroot",JsonStr(hashval_hexstring bhd.newledgerroot));
+	      ("target",JsonStr(string_of_big_int tinfo));
+	      ("difficulty",JsonStr(string_of_big_int (difficulty tinfo)))]
+	 in
+         let jr =
+           match bhd.pureburn with
+           | Some(h,v) -> ("pureburn",JsonObj([("txid1",JsonStr(hashval_hexstring h));("vout1",JsonNum(Int32.to_string v))]))::jr
+           | None -> jr
+         in
+	 let jr =
+	   match bhd.newtheoryroot with
+	   | Some(r) -> ("newtheoryroot",JsonStr(hashval_hexstring r))::jr
+	   | None -> jr
+	 in
+	 let jr =
+	   match bhd.newsignaroot with
+	   | Some(r) -> ("newsignaroot",JsonStr(hashval_hexstring r))::jr
+	   | None -> jr
+	 in
+         let j = JsonObj(("type",JsonStr("header"))::jr) in
+         print_jsonval oc j;
+         Printf.fprintf oc "\n";
+         print_ctree oc bhd.prevledger
+      | _ -> raise BadCommandForm);
   ac "retractltcblockandexit" "retractltcblockandexit <ltcblock>" "Purge ltc information back to the given block and exit.\nWhen Proofgold restarts it will resync with ltc back to the retracted block."
     (fun oc al ->
       match al with
@@ -2144,969 +3210,26 @@ let initialize_commands () =
   ac "commitdraft" "commitdraft <draftfile> <newtxfile>" "Form a transaction to publish a commitment for a draft file."
     (fun oc al ->
       match al with
-      | [f;g] ->
-	  let ch = open_in f in
-	  let l = input_token ch in
-	  let mkcommittx blkh lr beta =
-	    try
-	      let (aid,bday,obl) = find_marker_at_address (CHash(lr)) beta in
-	      if Int64.add bday commitment_maturation_minus_one <= blkh then (** this means 12 confirmations **)
-		Printf.fprintf oc "A commitment marker for this draft has already been published and matured.\nThe draft can be published with the publishdraft command.\n"
-	      else
-		Printf.fprintf oc "A commitment marker for this draft has already been published and will mature after %Ld more blocks.\nAfter that the draft can be published with the publishdraft command.\n" (Int64.sub (Int64.add bday commitment_maturation_minus_one) blkh )
-	    with Not_found ->
-	      try
-		let minfee = Int64.mul 1000L !Config.defaulttxfee in (** very rough overestimate of 1K bytes for commitment tx **)
-		let (alpha,(aid,_,_,_),v) = find_spendable_utxo oc lr blkh minfee in
-		let txinl = [(alpha,aid)] in
-		let txoutl =
-		  if v >= Int64.add 10000L minfee then (** only create change if it is at least 10000 atoms ***)
-		    [(alpha,(None,Currency(Int64.sub v minfee)));(beta,(None,Marker))]
-		  else
-		    [(beta,(None,Marker))]
-		in
-		let stau = ((txinl,txoutl),([],[])) in
-		let c2 = open_out_bin g in
-		begin
-		  try
-		    Commands.signtxc oc lr stau c2 [] [] None;
-		    close_out_noerr c2;
-		    Printf.fprintf oc "The commitment transaction (to publish the marker) was created.\nTo inspect it:\n> decodetxfile %s\nTo validate it:\n> validatetxfile %s\nTo send it:\n> sendtxfile %s\n" g g g
-		  with e ->
-		    close_out_noerr c2;
-		    raise e
-		end
-	      with Not_found ->
-		Printf.fprintf oc "Cannot find a spendable utxo to use to publish the marker.\n"
-	  in
-	  if l = "Theory" then
-	    let (thyspec,nonce,gamma,_,_,_,_) = input_theoryspec ch in
-            let counter = ref 0 in
-	    begin
-	      match Checking.check_theoryspec counter thyspec with
-	      | None -> raise (Failure "Theory spec does not check.\n")
-	      | Some(thy,sg) ->
-		  match hashtheory thy with
-		  | None ->
-		      Printf.fprintf oc "Theory is empty. It is correct but an empty theory is not allowed to be published.\n"
-		  | Some(thyh) ->
-		      match get_bestblock_print_warnings oc with
-		      | None -> Printf.fprintf oc "No blocks yet\n"
-		      | Some(h,lbk,ltx) ->
-			  let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
-			  let (_,_,lr,tr,_) = Db_validheadervals.dbget (hashpair lbk ltx) in
-			  try
-			    let tht = lookup_thytree tr in
-			    let _ = ottree_lookup tht (Some(thyh)) in
-			    Printf.fprintf oc "Theory %s has already been published.\n" (hashval_hexstring thyh)
-			  with Not_found ->
-			    match nonce with
-			    | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
-			    | Some(nonce) ->
-				match gamma with
-				| None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
-				| Some(gamma) ->
-				    if payaddr_p gamma then
-				      let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce thyh)) in
-				      mkcommittx blkh lr beta
-				    else
-				      raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
-	    end
-	  else if l = "Signature" then
-	    let thyid = input_token ch in
-	    let th = if thyid = "Empty" then None else Some(hexstring_hashval thyid) in
-	    let (blkh,lr,tr,sr) =
-	      match get_bestblock_print_warnings oc with
-	      | None -> raise Not_found
-	      | Some(dbh,lbk,ltx) ->
-		  let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
-		  let (_,_,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
-		  (blkh,lr,tr,sr)
-	    in
-	    let tht = lookup_thytree tr in
-	    let thy = try ottree_lookup tht th with Not_found -> raise (Failure (Printf.sprintf "Theory %s not found" thyid)) in
-	    let sgt = lookup_sigtree sr in
-	    let (signaspec,nonce,gamma,_,objhrev,_,prophrev) = input_signaspec ch th sgt in
-	    begin
-	      let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
-	      let remgvknth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
-	      let gvtp th1 h1 a =
-		if th1 = th then
-		  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
-		  let alpha = hashval_term_addr oid in
-		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
-		  match hlist_lookup_obj_owner true true true oid hl with
-		  | None -> false
-		  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
-		else
-		  false
-	      in
-	      let gvkn th1 k =
-		if th1 = th then
-		  let pid = hashtag (hashopair2 th k) 33l in
-		  let alpha = hashval_term_addr pid in
-		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
-		  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
-		  | None -> false
-		  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
-		else
-		  false
-	      in
-              let counter = ref 0 in
-	      match Checking.check_signaspec counter gvtp gvkn th thy sgt signaspec with
-	      | None -> raise (Failure "Signature does not check.\n")
-	      | Some((tml,knl),imported) ->
-		  let id = hashopair2 th (hashsigna (signaspec_signa signaspec)) in
-		  Printf.fprintf oc "Signature is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr (hashval_pub_addr id));
-		  Printf.fprintf oc "Signature imports %d signatures:\n" (List.length imported);
-		  List.iter (fun h -> Printf.fprintf oc " %s\n" (hashval_hexstring h)) imported;
-		  let oname h =
-		    try
-		      Hashtbl.find objhrev h
-		    with Not_found -> ""
-		  in
-		  let pname h =
-		    try
-		      Hashtbl.find prophrev h
-		    with Not_found -> ""
-		  in
-		  Printf.fprintf oc "Signature exports %d objects:\n" (List.length tml);
-		  List.iter (fun ((h,_),m) -> Printf.fprintf oc " '%s' %s %s\n" (oname h) (hashval_hexstring h) (match m with None -> "(opaque)" | Some(_) -> "(transparent)")) tml;
-		  Printf.fprintf oc "Signature exports %d props:\n" (List.length knl);
-		  List.iter (fun (h,_) -> Printf.fprintf oc " '%s' %s\n" (pname h) (hashval_hexstring h)) knl;
-		  let usesobjs = signaspec_uses_objs signaspec in
-		  let usesprops = signaspec_uses_props signaspec in
-		  let refusesig = ref false in
-		  Printf.fprintf oc "Signature uses %d objects:\n" (List.length usesobjs);
-		  List.iter
-		    (fun (oidpure,k) ->
-		      let oidthy = hashtag (hashopair2 th (hashpair oidpure k)) 32l in
-		      let alphapure = hashval_term_addr oidpure in
-		      let alphathy = hashval_term_addr oidthy in
-		      let nm = oname oidpure in
-		      try
-			let (beta,r) = local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy in
-			Printf.fprintf oc " Theory Object '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy)
-			  (addr_pfgaddrstr (payaddr_addr beta))
-			  (match r with
-			  | Some(0L) -> "free to use"
-			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-			match hlist_lookup_obj_owner true true true oidpure hl with
-			| None ->
-			    refusesig := true;
-			    Printf.fprintf oc "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **\n"
-			      (hashval_hexstring oidpure)
-			      (addr_pfgaddrstr alphapure)
-			| Some(beta,r) ->
-			    Printf.fprintf oc " Pure Object '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)
-			      (addr_pfgaddrstr (payaddr_addr beta))
-			      (match r with
-			      | Some(0L) -> "free to use"
-			      | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
-		      with Not_found ->
-			refusesig := true;
-			Printf.fprintf oc "  Did not find owner of theory object %s at %s when checking. Unexpected case.\n"
-			  (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy))
-		    usesobjs;
-		  Printf.fprintf oc "Signature uses %d props:\n" (List.length usesprops);
-		  List.iter
-		    (fun pidpure ->
-		      let pidthy = hashtag (hashopair2 th pidpure) 33l in
-		      let alphapure = hashval_term_addr pidpure in
-		      let alphathy = hashval_term_addr pidthy in
-		      let nm = pname pidpure in
-		      try
-			let (beta,r) = local_lookup_prop_thy_owner lr remgvknth pidthy alphathy in
-			Printf.fprintf oc " Theory Prop '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy)
-			  (addr_pfgaddrstr (payaddr_addr beta))
-			  (match r with
-			  | Some(0L) -> "free to use"
-			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-			match hlist_lookup_prop_owner true true true pidpure hl with
-			| None ->
-			    Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
-			      (hashval_hexstring pidpure)
-			      (addr_pfgaddrstr alphapure)
-			| Some(beta,r) ->
-			    Printf.fprintf oc "  Pure Prop %s (%s)\n  Owner %s: %s\n" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)
-			      (addr_pfgaddrstr (payaddr_addr beta))
-			      (match r with
-			      | Some(0L) -> "free to use"
-			      | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
-		      with Not_found ->
-			refusesig := true;
-			Printf.fprintf oc "  Did not find owner of theory proposition %s at %s when checking. Unexpected case.\n"
-			  (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy))
-		    usesprops;
-		  if !refusesig then
-		    Printf.fprintf oc "Cannot publish signature without resolving the issues above.\n"
-		  else
-		    match nonce with
-		    | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
-		    | Some(nonce) ->
-			match gamma with
-			| None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
-			| Some(gamma) ->
-			    if payaddr_p gamma then
-			      let signaspech = hashsigna (signaspec_signa signaspec) in
-			      let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce (hashopair2 th signaspech))) in
-			      mkcommittx blkh lr beta
-			    else
-			      raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
-	    end
-	  else if l = "Document" then
-	    let thyid = input_token ch in
-	    let th = if thyid = "Empty" then None else Some(hexstring_hashval thyid) in
-	    let (blkh,lr,tr,sr) =
-	      match get_bestblock_print_warnings oc with
-	      | None -> raise Not_found
-	      | Some(dbh,lbk,ltx) ->
-		  let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
-		  let (_,_,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
-		  (blkh,lr,tr,sr)
-	    in
-	    let tht = lookup_thytree tr in
-	    let thy = try ottree_lookup tht th with Not_found -> raise (Failure (Printf.sprintf "Theory %s not found" thyid)) in
-	    let sgt = lookup_sigtree sr in
-	    let (dl,nonce,gamma,_,_,_,_,_,_,_,_,_,_) = input_doc ch th sgt in
-	    let doch = hashdoc dl in
-	    let alphadoc = hashval_pub_addr (hashopair2 th doch) in
-	    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphadoc) in
-	    match hlist_lookup_asset_gen true true true (fun a -> match a with (_,_,_,DocPublication(_,_,_,_)) -> true | _ -> false) hl with
-	    | Some(aid,_,_,_) ->
-		Printf.fprintf oc "Document has already been published: address %s asset id %s\n" (Cryptocurr.addr_pfgaddrstr alphadoc) (hashval_hexstring aid)
-	    | None ->
-		begin
-		  let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
-		  let remgvknth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
-		  let refusecommit = ref false in
-		  let gvtp th1 h1 a =
-		    if th1 = th then
-		      let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
-		      let alpha = hashval_term_addr oid in
-		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
-		      match hlist_lookup_obj_owner true true true oid hl with
-		      | None -> false
-		      | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
-		    else
-		      false
-		  in
-		  let gvkn th1 k =
-		    if th1 = th then
-		      let pid = hashtag (hashopair2 th k) 33l in
-		      let alpha = hashval_term_addr pid in
-		      let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
-		      match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
-		      | None -> false
-		      | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
-		    else
-		      false
-		  in
-                  let counter = ref 0 in
-		  match Checking.check_doc counter gvtp gvkn th thy sgt dl with
-		  | None -> raise (Failure "Document does not check.\n")
-		  | Some(_) ->
-		      let id = hashopair2 th (hashdoc dl) in
-		      Printf.fprintf oc "Document is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr (hashval_pub_addr id));
-		      let usesobjs = doc_uses_objs dl in
-		      let usesprops = doc_uses_props dl in
-		      Printf.fprintf oc "Document uses %d objects:\n" (List.length usesobjs);
-		      List.iter
-			(fun (oidpure,k) ->
-			  let oidthy = hashtag (hashopair2 th (hashpair oidpure k)) 32l in
-			  let alphapure = hashval_term_addr oidpure in
-			  let alphathy = hashval_term_addr oidthy in
-			  try
-			    let (beta,r) = local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy in
-			    Printf.fprintf oc "  Theory Object %s (%s) Owner %s: %s\n" (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy)
-			      (addr_pfgaddrstr (payaddr_addr beta))
-			      (match r with
-			      | None -> refusecommit := true; "No right to use; document cannot be published unless this is redefined.\n"
-			      | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
-			    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-			    match hlist_lookup_obj_owner true true true oidpure hl with
-			    | None ->
-				Printf.fprintf oc "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **\n"
-				  (hashval_hexstring oidpure)
-				  (addr_pfgaddrstr alphapure)
-			    | Some(beta,r) ->
-				Printf.fprintf oc "  Pure Object %s (%s) Owner %s: %s\n" (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)
-				  (addr_pfgaddrstr (payaddr_addr beta))
-				  (match r with
-				  | None -> refusecommit := true; "No right to use; document cannot be published unless this is redefined.\n"
-				  | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
-			  with Not_found ->
-			    refusecommit := true;
-			    Printf.fprintf oc "  Did not find owner of theory object %s at %s when checking. Unexpected case.\n"
-			      (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy))
-			usesobjs;
-		      Printf.fprintf oc "Document uses %d props:\n" (List.length usesprops);
-		      List.iter
-			(fun pidpure ->
-			  let pidthy = hashtag (hashopair2 th pidpure) 33l in
-			  let alphapure = hashval_term_addr pidpure in
-			  let alphathy = hashval_term_addr pidthy in
-			  try
-			    let (beta,r) = local_lookup_prop_thy_owner lr remgvknth pidthy alphathy in
-			    Printf.fprintf oc "  Theory Prop %s (%s) Owner %s: %s\n" (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy)
-			      (addr_pfgaddrstr (payaddr_addr beta))
-			      (match r with
-			      | None -> refusecommit := true; "No right to use; document cannot be published unless this is reproven."
-			      | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
-			    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-			    match hlist_lookup_prop_owner true true true pidpure hl with
-			    | None ->
-				Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
-				  (hashval_hexstring pidpure)
-				  (addr_pfgaddrstr alphapure)
-			    | Some(beta,r) ->
-				Printf.fprintf oc "  Pure Prop %s (%s) Owner %s: %s\n" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)
-				  (addr_pfgaddrstr (payaddr_addr beta))
-				  (match r with
-				  | None -> refusecommit := true; "No right to use; document cannot be published unless this is reproven."
-				  | Some(r) -> if r = 0L then "free to use" else Printf.sprintf "each use costs %Ld atoms" r);
-			  with Not_found ->
-			    refusecommit := true;
-			    Printf.fprintf oc "  Did not find owner of theory proposition %s at %s when checking. Unexpected case.\n"
-			      (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy))
-			usesprops;
-		      if !refusecommit then
-			Printf.fprintf oc "Refusing to commit to the draft until the issues above are resolved.\n"
-		      else
-			match nonce with
-			| None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
-			| Some(nonce) ->
-			    match gamma with
-			    | None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
-			    | Some(gamma) ->
-				if payaddr_p gamma then
-				  let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce (hashopair2 th doch))) in
-				  mkcommittx blkh lr beta
-				else
-				  raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
-		end
-	  else
-	    begin
-	      close_in_noerr ch;
-	      raise (Failure (Printf.sprintf "Draft file has incorrect header: %s" l))
-	    end
+      | [f;g] -> commitdraft oc f g
       | _ -> raise BadCommandForm);
   ac "publishdraft" "publishdraft <draftfile> <newtxfile>" "Form a transaction to publish a committed draft file."
     (fun oc al ->
       match al with
+      | [f;g] -> publishdraft oc f g
+      | _ -> raise BadCommandForm);
+  ac "commitdraftandsend" "commitdraftandsend <draftfile> <newtxfile>" "Form a transaction to publish a commitment for a draft file and send the tx."
+    (fun oc al ->
+      match al with
       | [f;g] ->
-	  let ch = open_in f in
-	  let l = input_token ch in
-	  if l = "Theory" then
-	    let (thyspec,nonce,gamma,_,_,propownsh,proprightsh) = input_theoryspec ch in
-	    begin
-              let counter = ref 0 in
-	      match Checking.check_theoryspec counter thyspec with
-	      | None -> raise (Failure "Theory spec does not check.\n")
-	      | Some(thy,sg) ->
-		  match hashtheory thy with
-		  | None ->
-		      Printf.fprintf oc "Theory is empty. It is correct but an empty theory is not allowed to be published.\n"
-		  | Some(thyh) ->
-		      match get_bestblock_print_warnings oc with
-		      | None -> Printf.fprintf oc "No blocks yet\n"
-		      | Some(h,lbk,ltx) ->
-			  let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
-			  let (_,_,lr,tr,_) = Db_validheadervals.dbget (hashpair lbk ltx) in
-			  try
-			    let tht = lookup_thytree tr in
-			    let _ = ottree_lookup tht (Some(thyh)) in
-			    Printf.fprintf oc "Theory %s has already been published.\n" (hashval_hexstring thyh)
-			  with Not_found ->
-			    match nonce with
-			    | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
-			    | Some(h) ->
-				match gamma with
-				| None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
-				| Some(gamma) ->
-				    if payaddr_p gamma then
-				      let gammap = let (i,x0,x1,x2,x3,x4) = gamma in (i = 1,x0,x1,x2,x3,x4) in
-				      let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair h thyh)) in
-				      begin
-					try
-					  let (markerid,bday,obl) = find_marker_at_address (CHash(lr)) beta in
-					  try
-					    if Int64.add bday commitment_maturation_minus_one <= blkh then
-					      begin
-						let b = theoryspec_burncost thyspec in
-						try
-						  let delta = hashval_pub_addr thyh in
-						  let txoutl = [(delta,(None,TheoryPublication(gammap,h,thyspec)))] in
-						  let txoutlr = ref txoutl in
-						  let (_,kl) = thy in
-						  List.iter
-						    (fun h ->
-                                                      let pidpure = h in
-				                      let pidthy = hashtag (hashopair2 (Some(thyh)) pidpure) 33l in
-				                      let alphapure = hashval_term_addr pidpure in
-				                      let alphathy = hashval_term_addr pidthy in
-						      let gamma1p =
-							try
-							  Hashtbl.find propownsh h
-							with Not_found -> gammap
-						      in
-						      let (gamma2pp,rpp) =
-							try
-							  Hashtbl.find proprightsh (false,h)
-							with Not_found -> (gamma1p,Some(0L))
-						      in
-						      let (gamma2tp,rtp) =
-							try
-							  Hashtbl.find proprightsh (true,h)
-							with Not_found -> (gamma1p,Some(0L))
-						      in
-                                                      begin
-				                        let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-				                        match hlist_lookup_prop_owner true true true pidpure hl with
-                                                        | Some(_,_) -> () (** pure version already owned **)
-				                        | None -> (** pure version not owned yet **)
-						           txoutlr := (alphapure,(Some(gamma1p,0L,false),OwnsProp(pidpure,gamma2pp,rpp)))::!txoutlr
-                                                      end;
-                                                      (** the theory version cannot be previously owned unless the exact theory was already published, in which case the theory should not be republished **)
-                                                      txoutlr := (alphathy,(Some(gamma1p,0L,false),OwnsProp(pidthy,gamma2tp,rtp)))::!txoutlr)
-						    kl;
-						  let esttxbytes = 2000 + stxsize (([],!txoutlr),([],[])) in (** rough overestimate for txin and signatures at 2000 bytes **)
-						  let minfee = Int64.mul (Int64.of_int esttxbytes) !Config.defaulttxfee in
-						  let minamt = Int64.add b minfee in
-						  let (alpha,(aid,_,_,_),v) = find_spendable_utxo oc lr blkh minamt in
-						  let change = Int64.sub v minamt in
-						  if change >= 10000L then txoutlr := (alpha,(None,Currency(change)))::!txoutlr;
-						  let txinl = [(alpha,aid);(beta,markerid)] in
-						  let stau = ((txinl,!txoutlr),([],[])) in
-						  let c2 = open_out_bin g in
-						  begin
-						    try
-						      Commands.signtxc oc lr stau c2 [] [] None;
-						      let p = pos_out c2 in
-						      close_out_noerr c2;
-						      if p > 450000 then Printf.fprintf oc "Warning: The transaction has %d bytes and may be too large to be confirmed in a block.\n" p;
-						      Printf.fprintf oc "The transaction to publish the theory was created.\nTo inspect it:\n> decodetxfile %s\nTo validate it:\n> validatetxfile %s\nTo send it:\n> sendtxfile %s\n" g g g
-						    with e ->
-						      close_out_noerr c2;
-						      raise e
-						  end
-						with Not_found ->
-						  Printf.fprintf oc "Cannot find a spendable utxo to use to publish the marker.\n"
-					      end
-					    else
-					      Printf.fprintf oc "The commitment will mature after %Ld more blocks.\nThe draft can only be published after the commitment matures.\n" (Int64.sub (Int64.add bday commitment_maturation_minus_one) blkh)
-					  with Not_found -> Printf.fprintf oc "Could not find a utxo sufficient to fund publication tx.\n"
-					with Not_found ->
-					  Printf.fprintf oc "No commitment marker for this draft found.\nUse commitdraft to create and publish a commitment marker.\n"
-				      end
-				    else
-				      raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
-	    end
-	  else if l = "Signature" then
-	    let thyid = input_token ch in
-	    let th = if thyid = "Empty" then None else Some(hexstring_hashval thyid) in
-	    let (blkh,lr,tr,sr) =
-	      match get_bestblock_print_warnings oc with
-	      | None -> raise Not_found
-	      | Some(dbh,lbk,ltx) ->
-		  let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
-		  let (_,_,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
-		  (blkh,lr,tr,sr)
-	    in
-	    let tht = lookup_thytree tr in
-	    let thy = try ottree_lookup tht th with Not_found -> raise (Failure (Printf.sprintf "Theory %s not found" thyid)) in
-	    let sgt = lookup_sigtree sr in
-	    let (signaspec,nonce,gamma,_,objhrev,_,prophrev) = input_signaspec ch th sgt in
-	    begin
-	      let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
-	      let remgvknth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
-	      let gvtp th1 h1 a =
-		if th1 = th then
-		  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
-		  let alpha = hashval_term_addr oid in
-		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
-		  match hlist_lookup_obj_owner true true true oid hl with
-		  | None -> false
-		  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
-		else
-		  false
-	      in
-	      let gvkn th1 k =
-		if th1 = th then
-		  let pid = hashtag (hashopair2 th k) 33l in
-		  let alpha = hashval_term_addr pid in
-		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
-		  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
-		  | None -> false
-		  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
-		else
-		  false
-	      in
-              let counter = ref 0 in
-	      match Checking.check_signaspec counter gvtp gvkn th thy sgt signaspec with
-	      | None -> raise (Failure "Signature does not check.\n")
-	      | Some((tml,knl),imported) ->
-		  let id = hashopair2 th (hashsigna (signaspec_signa signaspec)) in
-		  let delta = hashval_pub_addr id in
-		  let hldelta = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq delta) in
-		  if not (hldelta = HNil) then raise (Failure "Signature already seems to have been published.");
-		  Printf.fprintf oc "Signature is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr (hashval_pub_addr id));
-		  Printf.fprintf oc "Signature imports %d signatures:\n" (List.length imported);
-		  List.iter (fun h -> Printf.fprintf oc " %s\n" (hashval_hexstring h)) imported;
-		  let oname h =
-		    try
-		      Hashtbl.find objhrev h
-		    with Not_found -> ""
-		  in
-		  let pname h =
-		    try
-		      Hashtbl.find prophrev h
-		    with Not_found -> ""
-		  in
-		  Printf.fprintf oc "Signature exports %d objects:\n" (List.length tml);
-		  List.iter (fun ((h,_),m) -> Printf.fprintf oc " '%s' %s %s\n" (oname h) (hashval_hexstring h) (match m with None -> "(opaque)" | Some(_) -> "(transparent)")) tml;
-		  Printf.fprintf oc "Signature exports %d props:\n" (List.length knl);
-		  List.iter (fun (h,_) -> Printf.fprintf oc " '%s' %s\n" (pname h) (hashval_hexstring h)) knl;
-		  let usesobjs = signaspec_uses_objs signaspec in
-		  let usesprops = signaspec_uses_props signaspec in
-		  let refusesig = ref false in
-		  Printf.fprintf oc "Signature uses %d objects:\n" (List.length usesobjs);
-		  List.iter
-		    (fun (oidpure,k) ->
-		      let oidthy = hashtag (hashopair2 th (hashpair oidpure k)) 32l in
-		      let alphapure = hashval_term_addr oidpure in
-		      let alphathy = hashval_term_addr oidthy in
-		      let nm = oname oidpure in
-		      try
-			let (beta,r) = local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy in
-			Printf.fprintf oc " Theory Object '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy)
-			  (addr_pfgaddrstr (payaddr_addr beta))
-			  (match r with
-			  | Some(0L) -> "free to use"
-			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-			match hlist_lookup_obj_owner true true true oidpure hl with
-			| None ->
-			    refusesig := true;
-			    Printf.fprintf oc "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **\n"
-			      (hashval_hexstring oidpure)
-			      (addr_pfgaddrstr alphapure)
-			| Some(beta,r) ->
-			    Printf.fprintf oc " Pure Object '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)
-			      (addr_pfgaddrstr (payaddr_addr beta))
-			      (match r with
-			      | Some(0L) -> "free to use"
-			      | _ -> refusesig := true; "not free to use; signature cannot be published unless you redefine the object or buy the object and make it free for everyone.");
-		      with Not_found ->
-			refusesig := true;
-			Printf.fprintf oc "  Did not find owner of theory object %s at %s when checking. Unexpected case.\n"
-			  (hashval_hexstring oidthy) (addr_pfgaddrstr alphathy))
-		    usesobjs;
-		  Printf.fprintf oc "Signature uses %d props:\n" (List.length usesprops);
-		  List.iter
-		    (fun pidpure ->
-		      let pidthy = hashtag (hashopair2 th pidpure) 33l in
-		      let alphapure = hashval_term_addr pidpure in
-		      let alphathy = hashval_term_addr pidthy in
-		      let nm = pname pidpure in
-		      try
-			let (beta,r) = local_lookup_prop_thy_owner lr remgvknth pidthy alphathy in
-			Printf.fprintf oc " Theory Prop '%s' %s (%s)\n  Owner %s: %s\n" nm (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy)
-			  (addr_pfgaddrstr (payaddr_addr beta))
-			  (match r with
-			  | Some(0L) -> "free to use"
-			  | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
-			let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-			match hlist_lookup_prop_owner true true true pidpure hl with
-			| None ->
-			    Printf.fprintf oc "** Somehow the theory prop has an owner but the pure prop %s (%s) did not. Invariant failure. **\n"
-			      (hashval_hexstring pidpure)
-			      (addr_pfgaddrstr alphapure)
-			| Some(beta,r) ->
-			    Printf.fprintf oc "  Pure Prop %s (%s)\n  Owner %s: %s\n" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)
-			      (addr_pfgaddrstr (payaddr_addr beta))
-			      (match r with
-			      | Some(0L) -> "free to use"
-			      | _ -> refusesig := true; "not free to use; signature cannot be published unless you buy the proposition and make it free for everyone.");
-		      with Not_found ->
-			refusesig := true;
-			Printf.fprintf oc "  Did not find owner of theory proposition %s at %s when checking. Unexpected case.\n"
-			  (hashval_hexstring pidthy) (addr_pfgaddrstr alphathy))
-		    usesprops;
-		  if !refusesig then
-		    Printf.fprintf oc "Cannot publish signature without resolving the issues above.\n"
-		  else
-		    match nonce with
-		    | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
-		    | Some(nonce) ->
-			match gamma with
-			| None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
-			| Some(gamma) ->
-			    if payaddr_p gamma then
-			      let gammap = let (i,x0,x1,x2,x3,x4) = gamma in (i = 1,x0,x1,x2,x3,x4) in
-			      let signaspech = hashsigna (signaspec_signa signaspec) in
-			      let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce (hashopair2 th signaspech))) in
-			      begin
-				try
-				  let (markerid,bday,obl) = find_marker_at_address (CHash(lr)) beta in
-				  try
-				    if Int64.add bday commitment_maturation_minus_one <= blkh then
-				      begin
-					let b = signaspec_burncost signaspec in
-					let txinlr = ref [(beta,markerid)] in
-					let txoutlr = ref [(delta,(None,SignaPublication(gammap,nonce,th,signaspec)))] in
-					let esttxbytes = 2000 + stxsize (([],!txoutlr),([],[])) in (** rough overestimate for txin, possible change and signatures at 2000 bytes **)
-					let minfee = Int64.mul (Int64.of_int esttxbytes) !Config.defaulttxfee in
-					let tospend = ref (Int64.add b minfee) in
-					try
-					  let (alpha,(aid,_,_,_),v) = find_spendable_utxo oc lr blkh !tospend in
-					  let tauin = (alpha,aid)::!txinlr in
-					  let tauout = if Int64.sub v !tospend >= 10000L then (alpha,(None,Currency(Int64.sub v !tospend)))::!txoutlr else !txoutlr in
-					  let stau = ((tauin,tauout),([],[])) in
-					  let c2 = open_out_bin g in
-					  begin
-					    try
-					      Commands.signtxc oc lr stau c2 [] [] None;
-					      let p = pos_out c2 in
-					      close_out_noerr c2;
-					      if p > 450000 then Printf.fprintf oc "Warning: The transaction has %d bytes and may be too large to be confirmed in a block.\n" p;
-					      Printf.fprintf oc "The transaction to publish the signature was created.\nTo inspect it:\n> decodetxfile %s\nTo validate it:\n> validatetxfile %s\nTo send it:\n> sendtxfile %s\n" g g g
-					    with e ->
-					      close_out_noerr c2;
-					      raise e
-					  end
-					with Not_found -> Printf.fprintf oc "Could not find a utxo sufficient to fund publication tx.\n"
-				      end
-				    else
-				      Printf.fprintf oc "The commitment will mature after %Ld more blocks.\nThe draft can only be published after the commitment matures.\n" (Int64.sub (Int64.add bday commitment_maturation_minus_one) blkh)
-				  with Not_found -> Printf.fprintf oc "Not_found was raised while trying to construct the publication tx.\n"
-				with Not_found ->
-				  Printf.fprintf oc "No commitment marker for this draft found.\nUse commitdraft to create and publish a commitment marker.\n"
-			      end
-			    else
-			      raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
-	    end
-	  else if l = "Document" then
-	    let thyid = input_token ch in
-	    let th = if thyid = "Empty" then None else Some(hexstring_hashval thyid) in
-            let addrh : (payaddr,int64) Hashtbl.t = Hashtbl.create 10 in
-	    let (blkh,lr,tr,sr) =
-	      match get_bestblock_print_warnings oc with
-	      | None -> raise Not_found
-	      | Some(dbh,lbk,ltx) ->
-		  let (_,_,_,_,_,_,blkh) = Db_outlinevals.dbget (hashpair lbk ltx) in
-		  let (_,_,lr,tr,sr) = Db_validheadervals.dbget (hashpair lbk ltx) in
-		  (blkh,lr,tr,sr)
-	    in
-	    let tht = lookup_thytree tr in
-	    let thy = try ottree_lookup tht th with Not_found -> raise (Failure (Printf.sprintf "Theory %s not found" thyid)) in
-	    let sgt = lookup_sigtree sr in
-	    let (dl,nonce,gamma,paramh,objhrev,proph,prophrev,conjh,objownsh,objrightsh,propownsh,proprightsh,bountyh) = input_doc ch th sgt in
-	    let id = hashopair2 th (hashdoc dl) in
-	    let delta = hashval_pub_addr id in
-	    let hldelta = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq delta) in
-	    if not (hldelta = HNil) then raise (Failure "Document already seems to have been published.");
-	    begin
-	      let remgvtpth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
-	      let remgvknth : (hashval,payaddr * int64 option) Hashtbl.t = Hashtbl.create 100 in
-	      let gvtp th1 h1 a =
-		if th1 = th then
-		  let oid = hashtag (hashopair2 th (hashpair h1 (hashtp a))) 32l in
-		  let alpha = hashval_term_addr oid in
-		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
-		  match hlist_lookup_obj_owner true true true oid hl with
-		  | None -> false
-		  | Some(beta,r) -> Hashtbl.add remgvtpth oid (beta,r); true
-		else
-		  false
-	      in
-	      let gvkn th1 k =
-		if th1 = th then
-		  let pid = hashtag (hashopair2 th k) 33l in
-		  let alpha = hashval_term_addr pid in
-		  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alpha) in
-		  match hlist_lookup_prop_owner true true true pid hl with (*** A proposition has been proven in a theory iff it has an owner. ***)
-		  | None -> false
-		  | Some(beta,r) -> Hashtbl.add remgvknth pid (beta,r); true
-		else
-		  false
-	      in
-              let counter = ref 0 in
-	      match Checking.check_doc counter gvtp gvkn th thy sgt dl with
-	      | None -> raise (Failure "Document does not check.\n")
-	      | Some(_) ->
-		  Printf.fprintf oc "Document is correct and has id %s and address %s.\n" (hashval_hexstring id) (addr_pfgaddrstr delta);
-		  match nonce with
-		  | None -> Printf.fprintf oc "No nonce is given. Call addnonce to add one automatically.\n"
-		  | Some(nonce) ->
-		      match gamma with
-		      | None -> Printf.fprintf oc "No publisher address. Call addpublisher to add one.\n"
-		      | Some(gamma) ->
-			  if payaddr_p gamma then
-			    let gammap = let (i,x0,x1,x2,x3,x4) = gamma in (i = 1,x0,x1,x2,x3,x4) in
-			    let doch = hashdoc dl in
-			    let beta = hashval_pub_addr (hashpair (hashaddr gamma) (hashpair nonce (hashopair2 th doch))) in
-			    begin
-			      try
-				let (markerid,bday,obl) = find_marker_at_address (CHash(lr)) beta in
-				try
-				  if Int64.add bday commitment_maturation_minus_one <= blkh then
-				    begin
-				      let tospend = ref 0L in
-				      let al = ref [(markerid,bday,obl,Marker)] in
-				      let txinlr = ref [(beta,markerid)] in
-				      let txoutlr = ref [(delta,(None,DocPublication(gammap,nonce,th,dl)))] in
-                                      let revisituses = ref [] in
-				      let usesobjs = doc_uses_objs dl in
-				      let usesprops = doc_uses_props dl in
-				      let createsobjs = doc_creates_objs dl in
-				      let createsprops = doc_creates_props dl in
-				      let createsnegpropsaddrs2 = List.map (fun h -> hashval_term_addr (hashtag (hashopair2 th h) 33l)) (doc_creates_neg_props dl) in
-				      let objrightsassets : (hashval,addr * asset) Hashtbl.t = Hashtbl.create 10 in
-				      let proprightsassets : (hashval,addr * asset) Hashtbl.t = Hashtbl.create 10 in
-				      List.iter
-					(fun (alpha,a,v) ->
-					  match a with
-					  | (_,_,_,RightsObj(h,_)) -> Hashtbl.add objrightsassets h (alpha,a)
-					  | (_,_,_,RightsProp(h,_)) -> Hashtbl.add proprightsassets h (alpha,a)
-					  | _ -> ())
-					(Commands.get_spendable_assets_in_ledger oc lr blkh);
-				      let oname h =
-					try
-					  Hashtbl.find objhrev h
-					with Not_found -> ""
-				      in
-				      let pname h =
-					try
-					  Hashtbl.find prophrev h
-					with Not_found -> ""
-				      in
-				      List.iter
-					(fun (oidpure,k) ->
-					  let oidthy = hashtag (hashopair2 th (hashpair oidpure k)) 32l in
-					  let alphapure = hashval_term_addr oidpure in
-					  let alphathy = hashval_term_addr oidthy in
-					  let (beta,r) = local_lookup_obj_thy_owner lr remgvtpth oidthy alphathy in
-					  begin
-					    match r with
-					    | None -> raise (Failure (Printf.sprintf "No right to use theory object '%s' %s. It must be redefined." (oname oidpure) (hashval_hexstring oidthy)))
-					    | Some(i) when i > 0L -> (*** look for owned rights; if not increase 'tospend' to buy the rights ***)
-					       begin
-                                                 revisituses := (false,oidthy,beta,i)::!revisituses;
-                                                 if Hashtbl.mem objrightsassets oidthy then
-                                                   begin
-                                                     try
-                                                       let i2 = Hashtbl.find addrh beta in
-                                                       if i > i2 then Hashtbl.replace addrh beta i
-                                                     with Not_found ->
-                                                       Hashtbl.add addrh beta i
-                                                   end
-                                               end
-					    | _ -> ()
-					  end;
-					  begin
-					    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-					    match hlist_lookup_obj_owner true true true oidpure hl with
-					    | None -> raise (Failure (Printf.sprintf "** Somehow the theory object has an owner but the pure object %s (%s) did not. Invariant failure. **" (hashval_hexstring oidpure) (addr_pfgaddrstr alphapure)))
-					    | Some(beta,r) ->
-						match r with
-						| None -> raise (Failure (Printf.sprintf "No right to use pure object '%s' %s. It must be redefined." (oname oidpure) (hashval_hexstring oidpure)))
-						| Some(i) when i > 0L -> (*** look for owned rights; if not increase 'tospend' to buy the rights ***)
-					           begin
-                                                     revisituses := (false,oidpure,beta,i)::!revisituses;
-                                                     if Hashtbl.mem objrightsassets oidpure then
-                                                       begin
-                                                         try
-                                                           let i2 = Hashtbl.find addrh beta in
-                                                           if i > i2 then Hashtbl.replace addrh beta i
-                                                         with Not_found ->
-                                                           Hashtbl.add addrh beta i
-                                                       end
-                                                   end
-						| _ -> ()
-					  end)
-					usesobjs;
-				      List.iter
-					(fun pidpure ->
-					  let pidthy = hashtag (hashopair2 th pidpure) 33l in
-					  let alphapure = hashval_term_addr pidpure in
-					  let alphathy = hashval_term_addr pidthy in
-					  let (beta,r) = local_lookup_prop_thy_owner lr remgvknth pidthy alphathy in
-					  begin
-					    match r with
-					    | None -> raise (Failure (Printf.sprintf "No right to use theory proposition '%s' %s. It must be reproven." (pname pidpure) (hashval_hexstring pidthy)))
-					    | Some(i) when i > 0L -> (*** look for owned rights; if not increase 'tospend' to buy the rights ***)
-						begin
-                                                  revisituses := (true,pidthy,beta,i)::!revisituses;
-                                                  if Hashtbl.mem proprightsassets pidthy then
-                                                    begin
-						      try
-                                                        let i2 = Hashtbl.find addrh beta in
-                                                        if i > i2 then Hashtbl.replace addrh beta i
-                                                      with Not_found ->
-                                                        Hashtbl.add addrh beta i
-                                                    end
-						end
-					    | _ -> ()
-					  end;
-					  begin
-					    let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-					    match hlist_lookup_prop_owner true true true pidpure hl with
-					    | None -> raise (Failure (Printf.sprintf "** Somehow the theory proposition has an owner but the pure object %s (%s) did not. Invariant failure. **" (hashval_hexstring pidpure) (addr_pfgaddrstr alphapure)))
-					    | Some(beta,r) ->
-						match r with
-						| None -> raise (Failure (Printf.sprintf "No right to use pure proposition '%s' %s. It must be reproven." (pname pidpure) (hashval_hexstring pidpure)))
-						| Some(i) when i > 0L -> (*** look for owned rights; if not increase 'tospend' to buy the rights ***)
-						   begin
-                                                     revisituses := (true,pidpure,beta,i)::!revisituses;
-                                                     if Hashtbl.mem proprightsassets pidpure then
-                                                       begin
-						         try
-                                                           let i2 = Hashtbl.find addrh beta in
-                                                           if i > i2 then Hashtbl.replace addrh beta i
-                                                         with Not_found ->
-                                                           Hashtbl.add addrh beta i
-                                                       end
-						   end
-						| _ -> ()
-					  end)
-					usesprops;
-                                      Hashtbl.iter
-                                        (fun beta m ->
-                                          tospend := Int64.add !tospend m;
-                                          txoutlr := (payaddr_addr beta,(None,Currency(m)))::!txoutlr)
-                                        addrh;
-                                      List.iter
-                                        (fun (b1,h1,beta1,i1) ->
-                                          try
-                                            let i2 = Hashtbl.find addrh beta1 in
-                                            if i2 < i1 then raise Not_found;
-                                          with Not_found ->
-                                            try
-                                              let (alpha,a) = Hashtbl.find (if b1 then proprightsassets else objrightsassets) h1 in
-					      match a with
-					      | (aid,bday,obl,RightsObj(h,r)) when not b1 ->
-						 if r > 0L then
-						   begin
-						     al := a::!al;
-						     txinlr := (alpha,aid)::!txinlr;
-                                                     if r > 1L then txoutlr := (alpha,(obl,RightsObj(h,Int64.sub r 1L)))::!txoutlr;
-                                                   end
-                                                 else
-                                                   raise Not_found
-					      | (aid,bday,obl,RightsProp(h,r)) when b1 ->
-						 if r > 0L then
-						   begin
-						     al := a::!al;
-						     txinlr := (alpha,aid)::!txinlr;
-                                                     if r > 1L then txoutlr := (alpha,(obl,RightsProp(h,Int64.sub r 1L)))::!txoutlr;
-                                                   end
-                                                 else
-                                                   raise Not_found
-                                              | _ ->
-                                                 raise Not_found
-                                            with Not_found ->
-                                              raise (Failure (Printf.sprintf "Problem obtaining rights for %s" (hashval_hexstring h1))))
-                                        !revisituses;
-				      List.iter
-					(fun (h,k) ->
-					  let oidpure = h in
-					  let oidthy = hashtag (hashopair2 th (hashpair h k)) 32l in
-					  let alphapure = hashval_term_addr oidpure in
-					  let alphathy = hashval_term_addr oidthy in
-					  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-					  begin
-					    match hlist_lookup_obj_owner true true true oidpure hl with
-					    | Some(_) -> ()
-					    | None ->
-						let delta1 = try Hashtbl.find objownsh oidpure with Not_found -> gammap in
-						let (delta2,r) = try Hashtbl.find objrightsh (false,oidpure) with Not_found -> (gammap,Some(0L)) in
-						txoutlr := (alphapure,(Some(delta1,0L,false),OwnsObj(oidpure,delta2,r)))::!txoutlr
-					  end;
-					  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
-					  begin
-					    match hlist_lookup_obj_owner true true true oidthy hl with
-					    | Some(_) -> ()
-					    | None ->
-						let delta1 = try Hashtbl.find objownsh oidpure with Not_found -> gammap in
-						let (delta2,r) = try Hashtbl.find objrightsh (true,oidpure) with Not_found -> (gammap,Some(0L)) in
-						txoutlr := (alphathy,(Some(delta1,0L,false),OwnsObj(oidthy,delta2,r)))::!txoutlr
-					  end)
-					createsobjs;
-				      List.iter
-					(fun pidpure ->
-					  let pidthy = hashtag (hashopair2 th pidpure) 33l in
-					  let alphapure = hashval_term_addr pidpure in
-					  let alphathy = hashval_term_addr pidthy in
-					  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphapure) in
-					  begin
-					    match hlist_lookup_prop_owner true true true pidpure hl with
-					    | Some(_) -> ()
-					    | None ->
-						let delta1 = try Hashtbl.find propownsh pidpure with Not_found -> gammap in
-						let (delta2,r) = try Hashtbl.find proprightsh (false,pidpure) with Not_found -> (gammap,Some(0L)) in
-						txoutlr := (alphapure,(Some(delta1,0L,false),OwnsProp(pidpure,delta2,r)))::!txoutlr
-					  end;
-					  let hl = ctree_lookup_addr_assets_lsreq (CHash(lr)) (addr_bitseq alphathy) in
-					  begin
-					    match hlist_lookup_prop_owner true true true pidthy hl with
-					    | Some(_) -> ()
-					    | None ->
-						let delta1 = try Hashtbl.find propownsh pidpure with Not_found -> gammap in
-						let (delta2,r) = try Hashtbl.find proprightsh (true,pidpure) with Not_found -> (gammap,Some(0L)) in
-						txoutlr := (alphathy,(Some(delta1,0L,false),OwnsProp(pidthy,delta2,r)))::!txoutlr
-					  end)
-					createsprops;
-				      List.iter
-					(fun alpha -> txoutlr := (alpha,(Some(gammap,0L,false),OwnsNegProp))::!txoutlr)
-					createsnegpropsaddrs2;
-				      Hashtbl.iter
-					(fun pidpure (amt,olkh) ->
-					  let pidthy = hashtag (hashopair2 th pidpure) 33l in
-					  let alphathy = hashval_term_addr pidthy in
-					  tospend := Int64.add amt !tospend;
-					  match olkh with
-					  | None -> txoutlr := (alphathy,(None,Bounty(amt)))::!txoutlr
-					  | Some(deltap,lkh) -> txoutlr := (alphathy,(Some(deltap,lkh,false),Bounty(amt)))::!txoutlr)
-					bountyh;
-				      try
-					let esttxbytes = 2000 + stxsize ((!txinlr,!txoutlr),([],[])) + 200 * estimate_required_signatures !al (!txinlr,!txoutlr) in (** rough overestimate for funding asset, possible change and signature for the funding asset 2000 bytes; overestimate of 200 bytes per other signature **)
-					let minfee = Int64.mul (Int64.of_int esttxbytes) !Config.defaulttxfee in
-					tospend := Int64.add !tospend minfee;
-					let (alpha,(aid,_,_,_),v) = find_spendable_utxo oc lr blkh !tospend in
-					let tauin = (alpha,aid)::!txinlr in
-					let tauout = if Int64.sub v !tospend > 10000L then (alpha,(None,Currency(Int64.sub v !tospend)))::!txoutlr else !txoutlr in
-					let stau = ((tauin,tauout),([],[])) in
-					let c2 = open_out_bin g in
-					begin
-					  try
-					    Commands.signtxc oc lr stau c2 [] [] None;
-					    let p = pos_out c2 in
-					    close_out_noerr c2;
-					    if p > 450000 then Printf.fprintf oc "Warning: The transaction has %d bytes and may be too large to be confirmed in a block.\n" p;
-					    Printf.fprintf oc "The transaction to publish the document was created.\nTo inspect it:\n> decodetxfile %s\nTo validate it:\n> validatetxfile %s\nTo send it:\n> sendtxfile %s\n" g g g
-					  with e ->
-					    close_out_noerr c2;
-					    raise e
-					end
-				      with Not_found -> Printf.fprintf oc "Could not find a utxo sufficient to fund publication tx.\n"
-				    end
-				  else
-				    Printf.fprintf oc "The commitment will mature after %Ld more blocks.\nThe draft can only be published after the commitment matures.\n" (Int64.sub (Int64.add bday commitment_maturation_minus_one) blkh)
-				with Not_found -> Printf.fprintf oc "Not_found was raised while trying to create the publication tx.\n"
-			      with Not_found ->
-				Printf.fprintf oc "No commitment marker for this draft found.\nUse commitdraft to create and publish a commitment marker.\n"
-			    end
-			  else
-			    raise (Failure (Printf.sprintf "Publisher address %s is not a pay address." (Cryptocurr.addr_pfgaddrstr gamma)))
-	    end
-	  else
-	    begin
-	      close_in_noerr ch;
-	      raise (Failure (Printf.sprintf "Draft file has incorrect header: %s" l))
-	    end
+         commitdraft oc f g;
+         sendtxfile oc g
+      | _ -> raise BadCommandForm);
+  ac "publishdraftandsend" "publishdraftandsend <draftfile> <newtxfile>" "Form a transaction to publish a committed draft file and send the tx."
+    (fun oc al ->
+      match al with
+      | [f;g] ->
+         publishdraft oc f g;
+         sendtxfile oc g
       | _ -> raise BadCommandForm);
   ac "createbuyrightstx" "createbuyrightstx <payaddr> <num of rights> <id> ... <id>" "Create tx to buy rights for objects and/or propositions to be held at the given pay address."
     (fun oc al ->
@@ -3410,7 +3533,7 @@ let initialize_commands () =
       match al with
       | [a] -> Commands.report_subtop_subsubtop oc (addr_bitseq (pfgaddrstr_addr a))
       | _ -> raise BadCommandForm);
-  ac "verifyfullledger" "verifyfullledger [<ledgerroot>]" "Ensure the node has the full ledger with the given ledger root. This may take serveral hours."
+  ac "verifyfullledger" "verifyfullledger [<ledgerroot>]" "Ensure the node has the full ledger with the given ledger root."
     (fun oc al ->
       match al with
       | [a] ->
@@ -4332,6 +4455,14 @@ let initialize_commands () =
       | _ -> raise BadCommandForm);
   ac "btctopfgaddr" "btctopfgaddr <btcaddress> [<btcaddress>] .. [<btcaddress>]" "Print the proofgold addresses corresponding to the given btc addresses."
     (fun oc al -> List.iter (Commands.btctopfgaddr oc) al);
+  ac "ltctopfgaddr" "ltctopfgaddr <ltcaddress> [<ltcaddress>] .. [<ltcaddress>]" "Print the proofgold addresses corresponding to the given ltc addresses."
+    (fun oc al -> List.iter (Commands.ltctopfgaddr oc) al);
+  ac "pfgtobtcaddr" "pfgtobtcaddr <pfgaddress> [<pfgaddress>] .. [<pfgaddress>]" "Print the btc addresses corresponding to the given proofgold addresses."
+    (fun oc al -> List.iter (Commands.pfgtobtcaddr oc) al);
+  ac "pfgtobtcwif" "pfgtobtcwif <pfgWIF>" "Print the btc private key WIF for the pfg private key WIF."
+    (fun oc al -> List.iter (Commands.pfgtobtcwif oc) al);
+  ac "pfgtoltcaddr" "pfgtobtcaddr <pfgaddress> [<pfgaddress>] .. [<pfgaddress>]" "Print the ltc addresses corresponding to the given proofgold addresses."
+    (fun oc al -> List.iter (Commands.pfgtoltcaddr oc) al);
   ac "printasset" "printasset <assethash>" "print information about the given asset"
     (fun oc al ->
       match al with
@@ -4623,8 +4754,319 @@ let initialize_commands () =
 	  Printf.fprintf oc "\nFund asset id 1: %s\n" (hashval_hexstring fundid1);
 	  Printf.fprintf oc "Fund asset id 2: %s\n" (hashval_hexstring fundid2)
 	end);
+  ac "createbtcswap" "createbtcswap <p2pkhaddr:alpha> <p2pkhaddr:beta> [<secret>]"
+    "Create hash timelock contract scripts for swapping btc and pfg.\nThe alpha address is for Alice (who is swapping btc for pfg) and\n the beta address is for Bob (who is swapping pfg for btc).\nBob is the one who calls this command since it generates the secret.\nThe addresses are given in pfg format (see command btctopfgaddr) and the private keys\nNote: This same commands should work for swapping with bch instead of btc.\n"
+    (fun oc al ->
+      let (palphastr,pbetastr,secr) =
+        match al with
+        | [palphastr;pbetastr] ->
+           let secr = big_int_hashval (strong_rand_256()) in
+           (palphastr,pbetastr,secr)
+        | [palphastr;pbetastr;secr] ->
+           (palphastr,pbetastr,hexstring_hashval secr)
+        | _ -> raise BadCommandForm
+      in
+      let palpha = pfgaddrstr_addr palphastr in
+      if not (p2pkhaddr_p palpha) then raise (Failure "proofgold addresses for swap must be p2pkh");
+      let pbeta = pfgaddrstr_addr pbetastr in
+      if not (p2pkhaddr_p pbeta) then raise (Failure "proofgold addresses for swap must be p2pkh");
+      let (_,av0,av1,av2,av3,av4) = palpha in
+      let av = (av0,av1,av2,av3,av4) in
+      let (_,bv0,bv1,bv2,bv3,bv4) = pbeta in
+      let bv = (bv0,bv1,bv2,bv3,bv4) in
+      let (pfggamma,pfgscrl,secrh) = Commands.createhtlc av bv 72l true secr in (* this is the htlc for proofgold: Alice and secret or Bob after 72 confirmations  *)
+      let (btcgamma,btcscrl,_) = Commands.createbtchtlc bv av 127 true secr in (* this is the htlc for bitcoin: Bob and secret or Alice after 127 confirmations  *)
+      Printf.fprintf oc "Pfg script: ";
+      List.iter (fun x -> Printf.fprintf oc "%02x" x) pfgscrl;
+      Printf.fprintf oc "\n";
+      Printf.fprintf oc "Pfg p2sh: %s\n" (addr_pfgaddrstr (p2shaddr_addr pfggamma));
+      Printf.fprintf oc "Btc script: ";
+      List.iter (fun x -> Printf.fprintf oc "%02x" x) btcscrl;
+      Printf.fprintf oc "\n";
+      Printf.fprintf oc "Btc p2sh: %s\n" (payaddr_btcaddrstr (p2shaddr_payaddr btcgamma));
+      Printf.fprintf oc "Secret: %s\n" (hashval_hexstring secr);
+      Printf.fprintf oc "Hash of secret: %s\n" (hashval_hexstring secrh));
+  ac "validatebtcswap" "validatebtcswap <p2pkhaddr:alpha> <p2pkhaddr:beta> <hashofsecret> <pfgp2shaddr> <btcp2shaddr>"
+    "Validate hash timelock contract script addresses for swapping btc and pfg.\nThe alpha address is for Alice (who is swapping btc for pfg) and\n the beta address is for Bob (who is swapping pfg for btc).\nBob is the one who calls this command since it generates the secret.\nThe addresses are given in pfg format (see command btctopfgaddr) and the private keys\nshould be in Alice and Bob's Proofgold wallet.\nNote: This same commands should work for swapping with bch instead of btc.\n"
+    (fun oc al ->
+      match al with
+      | [palphastr;pbetastr;secrh;pfggammastr;btcgammastr] ->
+	 begin
+           let secrethash = hexstring_hashval secrh in
+           let palpha = pfgaddrstr_addr palphastr in
+           if not (p2pkhaddr_p palpha) then raise (Failure "proofgold addresses for swap must be p2pkh");
+           let pbeta = pfgaddrstr_addr pbetastr in
+           if not (p2pkhaddr_p pbeta) then raise (Failure "proofgold addresses for swap must be p2pkh");
+           let pfggamma = pfgaddrstr_addr pfggammastr in
+           if not (p2shaddr_p pfggamma) then raise (Failure "proofgold contract address must be p2sh");
+           let btcgamma = btcaddrstr_addr btcgammastr in
+           if not (p2shaddr_p btcgamma) then raise (Failure "bitcoin contract address must be p2sh");
+           let (_,av0,av1,av2,av3,av4) = palpha in
+           let av = (av0,av1,av2,av3,av4) in
+           let (_,bv0,bv1,bv2,bv3,bv4) = pbeta in
+           let bv = (bv0,bv1,bv2,bv3,bv4) in
+           let (pfggamma2,pfgscrl,secrh) = Commands.createhtlc2 av bv 72l true secrethash in (* this is the htlc for proofgold: Alice and secret or Bob after 72 confirmations  *)
+           let (btcgamma2,btcscrl,_) = Commands.createbtchtlc2 bv av 127 true secrethash in (* this is the htlc for bitcoin: Bob and secret or Alice after 127 confirmations  *)
+           if (p2shaddr_addr pfggamma2) = pfggamma then
+             if (p2shaddr_addr btcgamma2) = btcgamma then
+               Printf.fprintf oc "Swap contract addresses validated. Everything looks correct.\n"
+             else
+               Printf.fprintf oc "Bitcoin p2sh contract address mismatch. Abandon swap.\n"
+           else
+             if (p2shaddr_addr btcgamma2) = btcgamma then
+               Printf.fprintf oc "Proofgold p2sh contract address mismatch. Abandon swap.\n"
+             else
+               Printf.fprintf oc "Bitcoin and Proofgold p2sh contract addresses mismatch. Abandon swap.\n"
+         end
+      | _ -> raise BadCommandForm);
+  ac "dumpprivkey" "dumpprivkey <p2pkhaddr>" "Show the private key for a p2pkhaddr if it is in the wallet"
+    (fun oc al ->
+      match al with
+      | [palphastr] ->
+         let palpha = pfgaddrstr_addr palphastr in
+         if not (p2pkhaddr_p palpha) then raise (Failure "Not a p2pkh address");
+         let (_,xv0,xv1,xv2,xv3,xv4) = palpha in
+         let xv = (xv0,xv1,xv2,xv3,xv4) in
+         let (ka,ba) = Commands.privkey_from_wallet xv in
+         Printf.fprintf oc "Private key: %s\n" (pfgwif ka ba)
+      | _ -> raise BadCommandForm);
+  ac "dumpbtcprivkey" "dumpbtcprivkey <p2pkhaddr>" "Show the private key in btc WIF format for a p2pkhaddr if it is in the wallet"
+    (fun oc al ->
+      match al with
+      | [palphastr] ->
+         let palpha = pfgaddrstr_addr palphastr in
+         if not (p2pkhaddr_p palpha) then raise (Failure "Not a p2pkh address");
+         let (_,xv0,xv1,xv2,xv3,xv4) = palpha in
+         let xv = (xv0,xv1,xv2,xv3,xv4) in
+         let (ka,ba) = Commands.privkey_from_wallet xv in
+         Printf.fprintf oc "Private key: %s\n" (btcwif ka ba)
+      | _ -> raise BadCommandForm);
+  ac "collectbtcswap" "collectbtcswap <p2pkhaddr:alpha> <p2pkhaddr:beta> <secret> <btctxid> <vout> <btcamount>" "collectbtcswap creates and signs a bitcoin utxo with an htlc p2sh address\narising from an atomic swap (see createbtcswap)"
+    (fun oc al ->
+      match al with
+      | [palphastr;pbetastr;secrstr;txidstr;voutstr;btcamt] ->
+         let palpha = pfgaddrstr_addr palphastr in
+         if not (p2pkhaddr_p palpha) then raise (Failure "proofgold addresses for swap must be p2pkh");
+         let pbeta = pfgaddrstr_addr pbetastr in
+         if not (p2pkhaddr_p pbeta) then raise (Failure "proofgold addresses for swap must be p2pkh");
+         let (_,av0,av1,av2,av3,av4) = palpha in
+         let av = (av0,av1,av2,av3,av4) in
+         let (_,bv0,bv1,bv2,bv3,bv4) = pbeta in
+         let bv = (bv0,bv1,bv2,bv3,bv4) in
+         let secr = hexstring_hashval secrstr in
+         let txid = hexstring_hashval txidstr in
+         let txidrh = hashval_rev txid in
+         let vout = Int32.of_string voutstr in
+         let satoshis = litoshis_of_ltc btcamt in
+         let (btcgamma2,btcscrl,secrh) = Commands.createbtchtlc bv av 127 true secr in (* this is the htlc for bitcoin: Bob and secret or Alice after 127 confirmations  *)
+         let txs1b = Buffer.create 200 in
+         Buffer.add_char txs1b '\002';
+         Buffer.add_char txs1b '\000';
+         Buffer.add_char txs1b '\000';
+         Buffer.add_char txs1b '\000';
+         Buffer.add_char txs1b '\001';
+         ignore (seo_hashval seosb txidrh (txs1b,None));
+         List.iter (fun z -> Buffer.add_char txs1b (Char.chr z)) (blnum32 vout);
+         let txs1 = Buffer.contents txs1b in
+         Buffer.clear txs1b;
+         Buffer.add_string txs1b "\255\255\255\253\001"; (* opt-in rbf *)
+         List.iter (fun z -> Buffer.add_char txs1b (Char.chr z)) (blnum64 satoshis);
+         Buffer.add_char txs1b (Char.chr 0x19);
+         Buffer.add_char txs1b (Char.chr 0x76);
+         Buffer.add_char txs1b (Char.chr 0xa9);
+         Buffer.add_char txs1b (Char.chr 0x14);
+         ignore (seo_md160 seosb bv (txs1b,None));
+         Buffer.add_char txs1b (Char.chr 0x88);
+         Buffer.add_char txs1b (Char.chr 0xac);
+         Buffer.add_string txs1b "\000\000\000\000"; (*** locktime ***)
+         let txs2 = Buffer.contents txs1b in
+         Buffer.clear txs1b;
+         Buffer.add_string txs1b "\001\000\000\000"; (*** SIGHASH_ALL ***)
+         let txs3 = Buffer.contents txs1b in
+         Buffer.clear txs1b;
+         List.iter (fun z -> Buffer.add_char txs1b (Char.chr z)) btcscrl;
+         let redscr = Buffer.contents txs1b in
+         let redscrlen = String.length redscr in
+         let presignedtx = Printf.sprintf "%s%c%s%s%s" txs1 (Char.chr redscrlen) redscr txs2 txs3 in
+         let presignedtxh = sha256dstr presignedtx in
+         let r = strong_rand_256() in
+         let ((kb,bb),pubkey) = Commands.privkey_and_pubkey_from_wallet bv in
+         let sg = signat_hashval presignedtxh kb r in
+         let (sgr,sgs) = sg in
+         let sgs = if Zarithint.gt_big_int sgs (Zarithint.shift_right_towards_zero_big_int Secp256k1._n 1) then Zarithint.sub_big_int Secp256k1._n sgs else sgs in
+         Buffer.clear txs1b;
+         Buffer.add_char txs1b (Char.chr 0x30);
+         if Zarithint.gt_big_int (Zarithint.shift_right_towards_zero_big_int sgr 255) Zarithint.zero_big_int then
+           begin
+             Buffer.add_char txs1b (Char.chr 0x45);
+             Buffer.add_char txs1b (Char.chr 0x02);
+             Buffer.add_char txs1b (Char.chr 0x21);
+             Buffer.add_char txs1b (Char.chr 0x00);
+           end
+         else
+           begin
+             Buffer.add_char txs1b (Char.chr 0x44);
+             Buffer.add_char txs1b (Char.chr 0x02);
+             Buffer.add_char txs1b (Char.chr 0x20);
+           end;
+         ignore (seo_hashval seosb (big_int_hashval sgr) (txs1b,None));
+         Buffer.add_char txs1b (Char.chr 0x02);
+         Buffer.add_char txs1b (Char.chr 0x20);
+         ignore (seo_hashval seosb (big_int_hashval sgs) (txs1b,None));
+         Buffer.add_char txs1b (Char.chr 0x01);
+         let dersg = Buffer.contents txs1b in
+         let pubkeyhex = pubkey_hexstring pubkey bb in
+         let pubkeybinstr = hexstring_string pubkeyhex in
+         let secrbinstr = hexstring_string secrstr in
+         let sgscr = Printf.sprintf "%c%s%c%s%c%s%c%c%c%s" (Char.chr (String.length dersg)) dersg (Char.chr (String.length pubkeybinstr)) pubkeybinstr (Char.chr 32) secrbinstr (Char.chr 0x51) (Char.chr 0x4c) (Char.chr redscrlen) redscr in
+         Printf.fprintf oc "Send this bitcoin tx to collect the btc swap while revealing the secret.\n";
+         Printf.fprintf oc "It can be sent using sendrawtransaction in Bitcoin Core or broadcast using some Bitcoin explorers.\n";
+         Printf.fprintf oc "%s%02x%s%s\n" (string_hexstring txs1) (String.length sgscr) (string_hexstring sgscr) (string_hexstring txs2)
+      | _ -> raise BadCommandForm);
+  ac "refundbtcswap" "refundbtcswap <p2pkhaddr:alpha> <p2pkhaddr:beta> <hashofsecret> <btctxid> <vout> <btcamount>" "refundbtcswap creates and signs a bitcoin utxo with an htlc p2sh address\narising from an expired atomic swap attempt (see createbtcswap)"
+    (fun oc al ->
+      match al with
+      | [palphastr;pbetastr;secrhstr;txidstr;voutstr;btcamt] ->
+         let palpha = pfgaddrstr_addr palphastr in
+         if not (p2pkhaddr_p palpha) then raise (Failure "proofgold addresses for swap must be p2pkh");
+         let pbeta = pfgaddrstr_addr pbetastr in
+         if not (p2pkhaddr_p pbeta) then raise (Failure "proofgold addresses for swap must be p2pkh");
+         let (_,av0,av1,av2,av3,av4) = palpha in
+         let av = (av0,av1,av2,av3,av4) in
+         let (_,bv0,bv1,bv2,bv3,bv4) = pbeta in
+         let bv = (bv0,bv1,bv2,bv3,bv4) in
+         let secrh = hexstring_hashval secrhstr in
+         let txid = hexstring_hashval txidstr in
+         let txidrh = hashval_rev txid in
+         let vout = Int32.of_string voutstr in
+         let satoshis = litoshis_of_ltc btcamt in
+         let (btcgamma2,btcscrl,_) = Commands.createbtchtlc2 bv av 127 true secrh in (* this is the htlc for bitcoin: Bob and secret or Alice after 127 confirmations  *)
+         let txs1b = Buffer.create 200 in
+         Buffer.add_char txs1b '\002';
+         Buffer.add_char txs1b '\000';
+         Buffer.add_char txs1b '\000';
+         Buffer.add_char txs1b '\000';
+         Buffer.add_char txs1b '\001';
+         ignore (seo_hashval seosb txidrh (txs1b,None));
+         List.iter (fun z -> Buffer.add_char txs1b (Char.chr z)) (blnum32 vout);
+         let txs1 = Buffer.contents txs1b in
+         Buffer.clear txs1b;
+         Buffer.add_string txs1b "\127\000\000\000\001";
+         List.iter (fun z -> Buffer.add_char txs1b (Char.chr z)) (blnum64 satoshis);
+         Buffer.add_char txs1b (Char.chr 0x19);
+         Buffer.add_char txs1b (Char.chr 0x76);
+         Buffer.add_char txs1b (Char.chr 0xa9);
+         Buffer.add_char txs1b (Char.chr 0x14);
+         ignore (seo_md160 seosb av (txs1b,None));
+         Buffer.add_char txs1b (Char.chr 0x88);
+         Buffer.add_char txs1b (Char.chr 0xac);
+         Buffer.add_string txs1b "\000\000\000\000"; (*** locktime ***)
+         let txs2 = Buffer.contents txs1b in
+         Buffer.clear txs1b;
+         Buffer.add_string txs1b "\001\000\000\000"; (*** SIGHASH_ALL ***)
+         let txs3 = Buffer.contents txs1b in
+         Buffer.clear txs1b;
+         List.iter (fun z -> Buffer.add_char txs1b (Char.chr z)) btcscrl;
+         let redscr = Buffer.contents txs1b in
+         let redscrlen = String.length redscr in
+         let presignedtx = Printf.sprintf "%s%c%s%s%s" txs1 (Char.chr redscrlen) redscr txs2 txs3 in
+         let presignedtxh = sha256dstr presignedtx in
+         let r = strong_rand_256() in
+         let ((ka,ba),pubkey) = Commands.privkey_and_pubkey_from_wallet av in
+         let sg = signat_hashval presignedtxh ka r in
+         let (sgr,sgs) = sg in
+         let sgs = if Zarithint.gt_big_int sgs (Zarithint.shift_right_towards_zero_big_int Secp256k1._n 1) then Zarithint.sub_big_int Secp256k1._n sgs else sgs in
+         Buffer.clear txs1b;
+         Buffer.add_char txs1b (Char.chr 0x30);
+         if Zarithint.gt_big_int (Zarithint.shift_right_towards_zero_big_int sgr 255) Zarithint.zero_big_int then
+           begin
+             Buffer.add_char txs1b (Char.chr 0x45);
+             Buffer.add_char txs1b (Char.chr 0x02);
+             Buffer.add_char txs1b (Char.chr 0x21);
+             Buffer.add_char txs1b (Char.chr 0x00);
+           end
+         else
+           begin
+             Buffer.add_char txs1b (Char.chr 0x44);
+             Buffer.add_char txs1b (Char.chr 0x02);
+             Buffer.add_char txs1b (Char.chr 0x20);
+           end;
+         ignore (seo_hashval seosb (big_int_hashval sgr) (txs1b,None));
+         Buffer.add_char txs1b (Char.chr 0x02);
+         Buffer.add_char txs1b (Char.chr 0x20);
+         ignore (seo_hashval seosb (big_int_hashval sgs) (txs1b,None));
+         Buffer.add_char txs1b (Char.chr 0x01);
+         let dersg = Buffer.contents txs1b in
+         let pubkeyhex = pubkey_hexstring pubkey ba in
+         let pubkeybinstr = hexstring_string pubkeyhex in
+         let sgscr = Printf.sprintf "%c%s%c%s%c%c%c%s" (Char.chr (String.length dersg)) dersg (Char.chr (String.length pubkeybinstr)) pubkeybinstr (Char.chr 0x00) (Char.chr 0x4c) (Char.chr redscrlen) redscr in
+         Printf.fprintf oc "Send this bitcoin tx to refund the btc from the expired swap attempt.\n";
+         Printf.fprintf oc "It can be sent using sendrawtransaction in Bitcoin Core or broadcast using some Bitcoin explorers.\n";
+         Printf.fprintf oc "%s%02x%s%s\n" (string_hexstring txs1) (String.length sgscr) (string_hexstring sgscr) (string_hexstring txs2)
+      | _ -> raise BadCommandForm);
+  ac "signbtctx" "signbtctx <privatekey> <unsignedbtctxhex>" "signbtctx creates a DER encoded signature of the given btc tx (SIGHASH_ALL) using the given private key.\nThe private key can be given in btc or pfg WIF format.\nThe DER signature is prefixed by a byte giving its length.\nIt is up to the user to build the signed tx using this DER signature.\n"
+    (fun oc al ->
+      match al with
+      | [wif;btctxstr] ->
+         if String.length wif = 0 then raise BadCommandForm;
+         let (k,b) =
+           if wif.[0] = 'k' then
+             privkey_from_wif wif
+           else
+             privkey_from_btcwif wif
+         in
+         let tx = Printf.sprintf "%s\001\000\000\000" (hexstring_string btctxstr) in
+         let presignedtxh = sha256dstr tx in
+         let r = strong_rand_256() in
+         let sg = signat_hashval presignedtxh k r in
+         let (sgr,sgs) = sg in
+         let sgs = if Zarithint.gt_big_int sgs (Zarithint.shift_right_towards_zero_big_int Secp256k1._n 1) then Zarithint.sub_big_int Secp256k1._n sgs else sgs in
+         let dersb = Buffer.create 75 in
+         Buffer.add_char dersb (Char.chr 0x30);
+         if Zarithint.gt_big_int (Zarithint.shift_right_towards_zero_big_int sgr 255) Zarithint.zero_big_int then
+           begin
+             Buffer.add_char dersb (Char.chr 0x45);
+             Buffer.add_char dersb (Char.chr 0x02);
+             Buffer.add_char dersb (Char.chr 0x21);
+             Buffer.add_char dersb (Char.chr 0x00);
+           end
+         else
+           begin
+             Buffer.add_char dersb (Char.chr 0x44);
+             Buffer.add_char dersb (Char.chr 0x02);
+             Buffer.add_char dersb (Char.chr 0x20);
+           end;
+         ignore (seo_hashval seosb (big_int_hashval sgr) (dersb,None));
+         Buffer.add_char dersb (Char.chr 0x02);
+         Buffer.add_char dersb (Char.chr 0x20);
+         ignore (seo_hashval seosb (big_int_hashval sgs) (dersb,None));
+         Buffer.add_char dersb (Char.chr 0x01);
+         let dersg = Buffer.contents dersb in
+         Printf.fprintf oc "%02x%s\n" (String.length dersg) (string_hexstring dersg)
+      | _ -> raise BadCommandForm);
+  ac "extractsecretfrombtctx" "extractsecretfrombtctx <txid> <vout> <btctxhex>" "extract the secret from a btc tx spending an htlc tx\nThis is useful for btc atomic swaps.\nIf the btc tx is too big, use extractsecretfrombtctxfile.\n"
+    (fun oc al ->
+      match al with
+      | [txidstr;voutstr;btctx] ->
+         let txid = hexstring_hashval txidstr in
+         let vout = int_of_string voutstr in
+         let secr = Commands.extract_secret_from_btctx txid vout (hexstring_string btctx) in
+         Printf.fprintf oc "Secret: %s\n" (hashval_hexstring secr)
+      | _ -> raise BadCommandForm);
+  ac "extractsecretfrombtctxfile" "extractsecretfrombtctxfile <txid> <vout> <btctxhexfile>" "extract the secret from a btc tx spending an htlc tx\nThis is useful for btc atomic swaps.\nIf the btc tx is small, extractsecretfrombtctx will work.\n"
+    (fun oc al ->
+      match al with
+      | [txidstr;voutstr;btctxfile] ->
+         let txid = hexstring_hashval txidstr in
+         let vout = int_of_string voutstr in
+         let f = open_in btctxfile in
+         let l = input_line f in
+         close_in f;
+         let secr = Commands.extract_secret_from_btctx txid vout (hexstring_string l) in
+         Printf.fprintf oc "Secret: %s\n" (hashval_hexstring secr)
+      | _ -> raise BadCommandForm);
   ac "createhtlc" "createhtlc <p2pkhaddr:alpha> <p2pkhaddr:beta> <timelock> [relative] [<secret>] [json]"
-    "Create hash timelock constract script and address.\nThe controller of address alpha can spend with the secret.\nThe controller of the address beta can spend after the timelock.\nThe controller of address alpha should call this command and the secret will be held in alpha's wallet.\nA hex 32 byte secret can optionally be given, otherwise one will be randomly generated.\nIf 'relative' is given, then relative lock time (CSV) is used. Otherwise absolute lock time (CLTV) is used.\nThe timelock is either in block time (if less than 500000000) or unix time (otherwise).\nOnly block time can be used with relative block time."
+    "Create hash timelock contract script and address.\nThe controller of address alpha can spend with the secret.\nThe controller of the address beta can spend after the timelock.\nThe controller of address alpha should call this command and the secret will be held in alpha's wallet.\nA hex 32 byte secret can optionally be given, otherwise one will be randomly generated.\nIf 'relative' is given, then relative lock time (CSV) is used. Otherwise absolute lock time (CLTV) is used.\nThe timelock is either in block time (if less than 500000000) or unix time (otherwise).\nOnly block time can be used with relative block time."
     (fun oc al ->
       let (alphas,alpha,betas,beta,tmlock,rel,secr,jb) =
 	match al with
